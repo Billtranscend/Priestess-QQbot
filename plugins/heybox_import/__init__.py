@@ -1,7 +1,7 @@
 """从小黑盒（Heybox）“抽卡分析”导入更早的终末地、明日方舟抽卡记录。
 
-/zmd导入小黑盒 <小黑盒ID>    重建官方 API 已不再返回的卡池 / 时段
-/mrfz导入小黑盒 <小黑盒ID>   明日方舟，同上（见下面的“明日方舟”一节和 ark_plan.py）
+/导入小黑盒 <小黑盒ID>       一次补两款游戏：重建官方 API 已不再返回的卡池 / 时段。成员没有某款游戏的角色、
+                            或小黑盒账号里没有那款游戏的「抽卡分析」数据时，那款游戏跳过（明日方舟见下面一节和 ark_plan.py）
 /小黑盒登录                  超级用户私聊：扫码登录机器人读取明日方舟数据用的小黑盒账号；之后机器人每天自动续期
 
 官方抽卡记录 API 只能往回查几个月；小黑盒保存着用户更早上传的数据。终末地的公开概览（凭小黑盒 id
@@ -75,7 +75,7 @@ from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, te
 __plugin_meta__ = PluginMetadata(
     name="Heybox gacha import",
     description="从小黑盒「抽卡分析」补回官方接口已无法拉取的终末地、明日方舟抽卡记录。",
-    usage="/zmd导入小黑盒 小黑盒ID　/mrfz导入小黑盒 小黑盒ID",
+    usage="/导入小黑盒 小黑盒ID",
     type="application",
 )
 
@@ -89,17 +89,18 @@ ANSWER_TIMEOUT = 25000  # 等数据到达的毫秒数（通常约 7 秒：脚本
 FETCH_ATTEMPTS = 3
 RECONCILE_DELAY = 10  # 官方行写入后等几秒；它的事务得先提交
 RECONCILE_ATTEMPTS = 3
-QUEUE_WAIT = 120  # 前面有人在导入时最多排队等多少秒（一次导入通常十秒左右）
+QUEUE_WAIT = 300  # 前面有人在导入时最多排队等多少秒（一次导入两款游戏，通常半分钟左右）
 CN = timezone(timedelta(hours=8))
 
 async def _id_may_follow(event: Event, state: T_State) -> bool:
-    """和 strict_command 一样，但也接受 "/zmd导入小黑盒12345678"（数字紧贴在指令后面）。"""
+    """和 strict_command 一样，但也接受 "/导入小黑盒12345678"（数字紧贴在指令后面）。"""
     return command_ends_cleanly(event, state, digits=True)
 
 
-import_cmd = on_command("zmd导入小黑盒", aliases={"终末地导入小黑盒", "ef导入小黑盒", "导入小黑盒"}, rule=Rule(_id_may_follow), priority=5, block=True)
+import_cmd = on_command("导入小黑盒", rule=Rule(_id_may_follow), priority=5, block=True)
 _lock = asyncio.Lock()
 _last_run: dict[int, float] = {}
+_running: set[int] = set()  # 正在导入（含排队）的成员：重复发送时不再排第二次
 
 
 class ImportBusy(Exception):
@@ -121,9 +122,15 @@ async def _queued():
 
 
 WHERE_ID ="小黑盒 ID 是小黑盒 App 个人主页里的 ID 数字，不是游戏 UID"
-NOT_BOUND = "你还没有在机器人这里绑定森空岛。请先发送 /skl绑定 扫码绑定，绑定成功后再发送 {command} 小黑盒ID"
-NO_ROLE = "你绑定的森空岛账号下没有{game}角色，无法导入。如果刚创建角色，请先发送 /skl角色更新"
-GAMES = {"endfield": ("终末地", "/zmd导入小黑盒"), "arknights": ("明日方舟", "/mrfz导入小黑盒")}
+COMMAND = "/导入小黑盒"
+NOT_BOUND = f"你还没有在我这里绑定森空岛。请先发送 /skl绑定 扫码绑定，绑定成功后再发送 {COMMAND} 小黑盒ID"
+NO_ROLE = "你绑定的森空岛账号下没有终末地和明日方舟角色，无法导入。如果刚创建角色，请先发送 /skl角色更新"
+GAMES = {"endfield": "终末地", "arknights": "明日方舟"}
+NO_ROLE_SKIP = "你绑定的森空岛账号下没有{game}角色，已跳过"
+RECEIVED = "正在为你拉取{games}小黑盒抽卡记录"
+QUEUED = "。前面还有人在导入，轮到你会自动开始"
+STILL_RUNNING = "导入进行中，完成后会回复结果，请稍等"
+NO_DATA_SKIP = "小黑盒里没有{game}的抽卡分析数据（没绑定{game}，或还没点过更新），已跳过"
 
 
 def _uid(character: Character) -> str:
@@ -143,13 +150,15 @@ async def _roles(owner_id: int, session, app_code: str = "endfield") -> list[Cha
     return sorted(roles, key=lambda role: role.id != default_id)
 
 
-async def _bound_roles(owner_id: int, session, app_code: str = "endfield"):
-    """返回 (roles, "") 或 ([], 原因文字)。"""
-    game, command = GAMES[app_code]
-    if (await session.scalars(select(SkUser.id).where(SkUser.owner_id == owner_id).limit(1))).first() is None:
-        return [], NOT_BOUND.format(command=command)
-    roles = await _roles(owner_id, session, app_code)
-    return (roles, "") if roles else ([], NO_ROLE.format(game=game))
+async def _is_bound(owner_id: int, session) -> bool:
+    return (await session.scalars(select(SkUser.id).where(SkUser.owner_id == owner_id).limit(1))).first() is not None
+
+
+def _has_data(app_code: str, result: dict) -> bool:
+    """小黑盒账号里有没有这款游戏的「抽卡分析」数据（没绑这款游戏、或从没点过更新时没有）。plan.py / ark_plan.py 的同一检查。"""
+    if app_code == "endfield":
+        return bool(result.get("is_bind") and result.get("user_info"))
+    return bool(result.get("user_info") and (result.get("gacha_record") or {}).get("total_pools"))
 
 
 
@@ -516,12 +525,12 @@ def fetch_failure_text(error: Exception) -> str:
         said = f"：{error.args[0]}" if error.args and error.args[0] else ""
         return f"导入失败：小黑盒拒绝了这次查询{said}，没有写入任何数据。请过几分钟再试"
     if isinstance(error, (TimeoutError, httpx.TimeoutException)) or "Timeout" in type(error).__name__:
-        return "导入失败：小黑盒的网页连续 3 次没有加载出来，是小黑盒那边响应慢，还没走到核对小黑盒 ID 那一步。没有写入任何数据，请过几分钟再试"
+        return "导入失败：小黑盒的网页连续 3 次没加载出来（小黑盒那边响应慢），没有写入任何数据，请过几分钟再试"
     return f"导入失败：读取小黑盒数据时出错（{type(error).__name__}），没有写入任何数据。请过几分钟再试，一直失败请联系管理员"
 
 
 def summary(plan: Plan, app_code: str = "endfield") -> str:
-    game, _ = GAMES[app_code]
+    game = GAMES[app_code]
     record = "/zmd抽卡记录" if app_code == "endfield" else "/mrfz抽卡记录"
     if plan.error:
         return f"导入失败：{plan.error}"
@@ -540,8 +549,8 @@ def summary(plan: Plan, app_code: str = "endfield") -> str:
             lines.append(f"{'、'.join(f'「{name}」' for name in partial)}官方接口只剩后面一段记录，补的是前面查不到的那些抽")
     else:
         lines.append(
-            f"小黑盒里没有比机器人已有记录更早的抽卡数据，无需导入（小黑盒 {plan.heybox_pulls} 抽，机器人已有 {plan.official_pulls} 抽）。"
-            f"如果你在小黑盒里很久没更新，先去{game}「抽卡分析」点一次更新再试"
+            f"小黑盒里没有比我这里已有记录更早的抽卡数据，无需导入（小黑盒 {plan.heybox_pulls} 抽，我这里已有 {plan.official_pulls} 抽）。"
+            f"如果小黑盒很久没更新，先在小黑盒的{game}「抽卡分析」里点一次更新再试"
         )
     if plan.estimated:
         names = "、".join(f"「{name}」" for name in plan.estimated[:3]) + (f"等 {len(plan.estimated)} 个卡池" if len(plan.estimated) > 3 else "")
@@ -558,80 +567,113 @@ def summary(plan: Plan, app_code: str = "endfield") -> str:
     return "\n".join(lines)
 
 
-async def _import(matcher, app_code: str, user_session: UserSession, session, arg: Message) -> None:
-    """/zmd导入小黑盒 和 /mrfz导入小黑盒 共用的流程。"""
-    game, command = GAMES[app_code]
-    heybox_id = arg.extract_plain_text().strip()
-    if not (heybox_id.isdigit() and 4 <= len(heybox_id) <= 12):
-        logger.info(f"Heybox import ({app_code}) refused: usage")  # 原因只记类别，不记成员填的内容
-        await matcher.finish(
-            f"用法：{command} 小黑盒ID，例如 {command} 12345678\n"
-            f"{WHERE_ID}。导入前请先在小黑盒的{game}「抽卡分析」里点一次更新。\n"
-            f"只能导入与你已绑定的{game} UID 相同的小黑盒账号。"
-        )
-    user_id = user_session.user_id
-    roles, reason = await _bound_roles(user_id, session, app_code)
+async def _import_game(app_code: str, user_id: int, heybox_id: str, session) -> tuple[str, str]:
+    """导入一款游戏，返回 (结果, 给成员的话)。不在这里结束指令。
+
+    结果：imported 补回了记录；nothing 小黑盒没有更早的记录；no_role 成员没有这款游戏的角色；
+    no_data 小黑盒账号里没有这款游戏的数据；cooldown 刚导入过；failed 出错，没有写入。
+    """
+    game = GAMES[app_code]
+    roles = await _roles(user_id, session, app_code)  # 每款游戏重新查：前一款回滚后旧对象已过期
     if not roles:
-        logger.info(f"Heybox import ({app_code}) refused: no bound role")
-        await matcher.finish(reason, at_sender=True)
-    if any(heybox_id == _uid(role) for role in roles):
-        logger.info(f"Heybox import ({app_code}) refused: the game UID was given")
-        await matcher.finish(f"你填的是自己的游戏 UID。{WHERE_ID}，请换成小黑盒 ID 再试", at_sender=True)
+        return "no_role", NO_ROLE_SKIP.format(game=game)
     wait = COOLDOWN - (time.time() - _last_run.get((user_id, app_code), 0))
     if wait > 0:
-        logger.info(f"Heybox import ({app_code}) refused: imported {int(COOLDOWN - wait)} s ago")
-        await matcher.finish(f"刚导入过，请 {int(wait // 60) + 1} 分钟后再试", at_sender=True)
-    await _react(REACTION_PROCESSING)
+        logger.info(f"Heybox import ({app_code}) skipped: imported {int(COOLDOWN - wait)} s ago")
+        return "cooldown", f"刚导入过，请 {int(wait // 60) + 1} 分钟后再试"
     try:
-        async with _queued():
-            try:
-                result = await (fetch_overview if app_code == "endfield" else fetch_ark_analysis)(heybox_id)
-            except HeyboxLoginExpired:
-                logger.warning("Heybox import: the saved Heybox login is missing or expired")
-                await _react(REACTION_FAIL)
-                await _tell_login_lost()
-                await matcher.finish(LOGIN_LOST, at_sender=True)
-            except Exception as e:
-                logger.warning(f"Heybox fetch failed: {type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")  # Playwright 的调用日志里会出现小黑盒 id（所以只记第一行）
-                await _react(REACTION_FAIL)
-                await matcher.finish(fetch_failure_text(e), at_sender=True)
-            # 小黑盒账号会指明它的角色；导入就放到那个角色下，不管它是成员的哪一个角色。
-            heybox_uid = str((result.get("user_info") or {}).get("uid"))
-            character = next((role for role in roles if _uid(role) == heybox_uid), roles[0])
-            key = _snapshot_key(character)  # ORM 对象在提交后会过期；先留下普通值，供之后使用
-            plan = await run_import(session, character, result)
-            if plan.rows and not plan.error:
-                _last_run[(user_id, app_code)] = time.time()
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(_keep_raw, user_id, key, heybox_id, result)
-        logger.info(
-            f"Heybox import ({app_code}): error={plan.error[:16] or None} pools={len(plan.imported)} rows={len(plan.rows)} "
-            f"skipped={len(plan.skipped)} heybox_pulls={plan.heybox_pulls} official_pulls={plan.official_pulls}"
-        )
-    except MatcherException:
-        raise
-    except ImportBusy:
-        logger.info(f"Heybox import ({app_code}) refused: waited {QUEUE_WAIT} s for other imports")
-        await _react(REACTION_FAIL)
-        await matcher.finish("现在导入的人多，排队超过两分钟了，请过几分钟再试", at_sender=True)
+        result = await (fetch_overview if app_code == "endfield" else fetch_ark_analysis)(heybox_id)
+    except HeyboxLoginExpired:
+        logger.warning("Heybox import: the saved Heybox login is missing or expired")
+        await _tell_login_lost()
+        return "failed", LOGIN_LOST
+    except Exception as e:
+        logger.warning(f"Heybox fetch ({app_code}) failed: {type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")  # Playwright 的调用日志里会出现小黑盒 id（所以只记第一行）
+        return "failed", fetch_failure_text(e)
+    if not _has_data(app_code, result):
+        logger.info(f"Heybox import ({app_code}) skipped: no data for this game on the Heybox account")
+        return "no_data", NO_DATA_SKIP.format(game=game)
+    try:
+        # 小黑盒账号会指明它的角色；导入就放到那个角色下，不管它是成员的哪一个角色。
+        heybox_uid = str((result.get("user_info") or {}).get("uid"))
+        character = next((role for role in roles if _uid(role) == heybox_uid), roles[0])
+        key = _snapshot_key(character)  # ORM 对象在提交后会过期；先留下普通值，供之后使用
+        plan = await run_import(session, character, result)
     except Exception as e:
         await session.rollback()
-        logger.opt(exception=True).error(f"Heybox import failed while building or writing rows: {type(e).__name__}: {e}")
-        await _react(REACTION_FAIL)
-        await matcher.finish("导入时程序出错，没有写入任何数据。问题已记录，请稍后再试", at_sender=True)
-    await _react(REACTION_FAIL if plan.error else REACTION_DONE)
-    await UniMessage.text(summary(plan, app_code)).send(at_sender=True)
+        logger.opt(exception=True).error(f"Heybox import ({app_code}) failed while building or writing rows: {type(e).__name__}: {e}")
+        return "failed", "导入时程序出错，没有写入任何数据。问题已记录，请稍后再试"
+    if plan.rows and not plan.error:
+        _last_run[(user_id, app_code)] = time.time()
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(_keep_raw, user_id, key, heybox_id, result)
+    logger.info(
+        f"Heybox import ({app_code}): error={plan.error[:16] or None} pools={len(plan.imported)} rows={len(plan.rows)} "
+        f"skipped={len(plan.skipped)} heybox_pulls={plan.heybox_pulls} official_pulls={plan.official_pulls}"
+    )
+    if plan.error:
+        return "failed", summary(plan, app_code)
+    return ("imported" if plan.imported else "nothing"), summary(plan, app_code)
+
+
+async def _import(matcher, user_session: UserSession, session, arg: Message) -> None:
+    """/导入小黑盒：同一个小黑盒 ID 依次导入终末地和明日方舟，一条回复写两款游戏的结果。"""
+    heybox_id = arg.extract_plain_text().strip()
+    if not (heybox_id.isdigit() and 4 <= len(heybox_id) <= 12):
+        logger.info("Heybox import refused: usage")  # 原因只记类别，不记成员填的内容
+        await matcher.finish(
+            f"用法：{COMMAND} 小黑盒ID，例如 {COMMAND} 12345678\n"
+            f"{WHERE_ID}。一次导入终末地和明日方舟两款游戏，小黑盒里没有哪款游戏的数据就跳过哪款。"
+            "导入前请先在小黑盒的「抽卡分析」里点一次更新。\n"
+            "只能导入与你已绑定的游戏 UID 相同的小黑盒账号。"
+        )
+    user_id = user_session.user_id
+    if not await _is_bound(user_id, session):
+        logger.info("Heybox import refused: not bound")
+        await matcher.finish(NOT_BOUND, at_sender=True)
+    games = {app_code: [_uid(role) for role in await _roles(user_id, session, app_code)] for app_code in GAMES}
+    if not any(games.values()):
+        logger.info("Heybox import refused: no role in either game")
+        await matcher.finish(NO_ROLE, at_sender=True)
+    if any(heybox_id in uids for uids in games.values()):
+        logger.info("Heybox import refused: the game UID was given")
+        await matcher.finish(f"你填的是自己的游戏 UID。{WHERE_ID}，请换成小黑盒 ID 再试", at_sender=True)
+    if user_id in _running:
+        logger.info("Heybox import refused: this member's import is still running")
+        await matcher.finish(STILL_RUNNING, at_sender=True)
+    _running.add(user_id)
+    try:
+        await _react(REACTION_PROCESSING)
+        names = "和".join(GAMES[app_code] for app_code, uids in games.items() if uids)
+        await UniMessage.text(RECEIVED.format(games=names) + (QUEUED if _lock.locked() else "")).send(at_sender=True)  # 表情回应在官方机器人上看不到：先说一句收到了
+        results: dict[str, tuple[str, str]] = {}
+        try:
+            async with _queued():
+                for app_code in GAMES:
+                    results[app_code] = await _import_game(app_code, user_id, heybox_id, session)
+        except ImportBusy:
+            logger.info(f"Heybox import refused: waited {QUEUE_WAIT} s for other imports")
+            await _react(REACTION_FAIL)
+            await matcher.finish(f"现在导入的人多，排队超过 {QUEUE_WAIT // 60} 分钟了，请过一会儿再试", at_sender=True)
+    finally:
+        _running.discard(user_id)
+    outcomes = {app_code: outcome for app_code, (outcome, _) in results.items()}
+    lines = [f"【{GAMES[app_code]}】{text}" for app_code, (_, text) in results.items()]
+    if all(outcome in ("no_data", "no_role") for outcome in outcomes.values()):  # 有角色的游戏一个都没读到：多半填错了 ID
+        lines.append("这个小黑盒 ID 下没有读到任何游戏的抽卡数据。请确认填的是小黑盒 App 个人主页里的 ID 数字（不是游戏 UID），并且已经在小黑盒的「抽卡分析」里登录游戏账号、点过更新")
+    await _react(REACTION_DONE if "imported" in outcomes.values() or "failed" not in outcomes.values() else REACTION_FAIL)
+    await UniMessage.text("\n\n".join(lines)).send(at_sender=True)
 
 
 @import_cmd.handle()
 async def _(event: MessageEvent, user_session: UserSession, session: async_scoped_session, arg: Message = CommandArg()) -> None:
-    await _import(import_cmd, "endfield", user_session, session, arg)
+    await _import(import_cmd, user_session, session, arg)
 
 
 # ── 明日方舟：机器人用一个登录了的小黑盒账号去读 ─────────────────────────
 #
 # 明日方舟的“抽卡分析”只回答已登录的小黑盒账号（终末地的公开概览不用登录）。机器人保存一个专门账号的
-# 登录状态（LOGIN_FILE，0600，绝不打印）；成员发 /mrfz导入小黑盒 小黑盒ID 时，带着它打开工具页面，
+# 登录状态（LOGIN_FILE，0600，绝不打印）；成员发 /导入小黑盒 小黑盒ID 时，带着它打开工具页面，
 # 取页面自己发出的请求的回答。小黑盒的网页每次打开都会调用 account/restore_login，它把登录凭证换发成
 # 从那时起再有效 7 天；机器人每天早晚各打开一次（renew_login），登录就一直有效。续不上或已失效时私聊告诉超级用户，
 # 由他们私聊发 /小黑盒登录 重新扫码。
@@ -652,15 +694,14 @@ LOGIN_COOKIE = "user_pkey"  # 扫码登录成功后才有的 cookie
 LOGIN_WAIT = 150  # 等扫码的秒数（二维码约 2 分钟内有效）
 LOGIN_LOST_REPEAT = 6 * 3600  # 登录失效的私聊提醒，隔多久才再发一次
 DESKTOP_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-LOGIN_LOST = "导入暂时用不了：机器人读取小黑盒用的登录已失效，已通知管理员重新登录，请过段时间再试"
-LOGIN_LOST_NOTICE = "小黑盒登录已失效，成员现在无法用 /mrfz导入小黑盒。请私聊机器人发送 /小黑盒登录，用机器人专用的小黑盒账号扫码"
-RENEW_FAILING = "小黑盒登录这几天没能自动续期，{until} 到期；到期后成员将无法用 /mrfz导入小黑盒。可以私聊机器人发送 /小黑盒登录 重新扫码"
+LOGIN_LOST = "暂时导入不了：我读取小黑盒用的登录已失效，已通知管理员重新登录，请过段时间再试"
+LOGIN_LOST_NOTICE = "小黑盒登录已失效，成员现在用 /导入小黑盒 导入不了明日方舟。请私聊机器人发送 /小黑盒登录，用机器人专用的小黑盒账号扫码"
+RENEW_FAILING = "小黑盒登录这几天没能自动续期，{until} 到期；到期后成员用 /导入小黑盒 导入不了明日方舟。可以私聊机器人发送 /小黑盒登录 重新扫码"
 QR_DRAWN = (  # 二维码画好之前是空白的：数一数深色像素
     "c => { try { const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0;"
     " for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 0 && d[i] < 100) n++; return n; } catch (e) { return 9999; } }"
 )
 
-ark_import_cmd = on_command("mrfz导入小黑盒", aliases={"方舟导入小黑盒", "明日方舟导入小黑盒"}, rule=Rule(_id_may_follow), priority=5, block=True)
 login_cmd = on_command("小黑盒登录", rule=strict, permission=SUPERUSER, priority=5, block=True)
 _login_lost_told = 0.0
 
@@ -770,11 +811,6 @@ async def _renew_daily() -> None:
             await tell_superusers(RENEW_FAILING.format(until=f"{datetime.fromtimestamp(until, CN):%m-%d %H:%M}"), "Heybox import")
 
 
-@ark_import_cmd.handle()
-async def _(event: MessageEvent, user_session: UserSession, session: async_scoped_session, arg: Message = CommandArg()) -> None:
-    await _import(ark_import_cmd, "arknights", user_session, session, arg)
-
-
 async def _login_qr(page) -> bytes:
     """打开小黑盒的网页登录，换到扫码登录，等二维码画好后截图。"""
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
@@ -828,12 +864,12 @@ async def _(event: MessageEvent) -> None:
     await login_cmd.finish(f"小黑盒登录成功（凭证 {until:%m-%d %H:%M} 到期）。机器人每天早晚自动续期，一般不用再扫码；续不上时会私聊提醒你")
 
 
-# 上游按导出链接导入（skland import）：小黑盒的导出给不出链接，明日方舟改为按小黑盒 ID 导入。
+# 上游按导出链接导入（skland import）：小黑盒的导出给不出链接，明日方舟按小黑盒 ID 导入。
 # 上游的指令已由 plugins.skland_shortcuts 关闭；这里以防万一还有别的路走到它。
 
 
 async def _ark_link_import(url, user_session, session, *, role_index=None) -> None:
-    await UniMessage("明日方舟改为按小黑盒 ID 导入：/mrfz导入小黑盒 小黑盒ID").finish(at_sender=True)
+    await UniMessage(f"明日方舟的早期抽卡记录从小黑盒导入：{COMMAND} 小黑盒ID").finish(at_sender=True)
 
 
 ark_gacha_command.import_handler = _ark_link_import

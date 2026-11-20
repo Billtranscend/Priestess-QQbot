@@ -238,7 +238,7 @@ def build_ark_plan(result: dict, uid: str, official: list[Official], game_pools:
         )
         return plan
     if str(result["user_info"].get("uid")) != str(uid):
-        plan.error = "这个小黑盒账号绑定的明日方舟 UID 与你在机器人绑定的不一致，不能导入别人的记录"
+        plan.error = "这个小黑盒账号绑定的明日方舟 UID 与你在我这里绑定的不一致，不能导入别人的记录"
         return plan
 
     plan.official_pulls = len(official)
@@ -296,7 +296,7 @@ def build_ark_plan(result: dict, uid: str, official: list[Official], game_pools:
         staged.append((members, known, estimated))
 
     if not _agrees([pool for members, _, _ in staged for pool in members], official):
-        plan.error = "小黑盒的记录和机器人已有的官方记录对不上，已拒绝导入"
+        plan.error = "小黑盒的记录和我这里已有的官方记录对不上，已拒绝导入"
         plan.pools = []
         return plan
 
@@ -312,7 +312,7 @@ def build_ark_plan(result: dict, uid: str, official: list[Official], game_pools:
                 part = _head(pool, known, official)
                 if part is None:
                     if sum(1 for row in official if row.pool_id == pool.game.pool_id) < pool.cost:
-                        outcome.skipped = "机器人已有这个卡池的一部分官方记录，这个卡池没有补"
+                        outcome.skipped = "我这里已有这个卡池的一部分官方记录，这个卡池没有补"
                         plan.pools.append(outcome)
                     continue
                 outcome.partial = True

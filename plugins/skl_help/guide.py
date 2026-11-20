@@ -31,8 +31,6 @@ class Section:
 @dataclass
 class Guide:
     heading: str = ""
-    tasks_title: str = ""
-    tasks: list[tuple[str, list[str]]] = field(default_factory=list)  # 一栏的标题，以及其下自动运行的任务
     notes: list[tuple[str, list[str]]] = field(default_factory=list)  # 标题和它下面的各行
     alias: str = ""
     sections: list[Section] = field(default_factory=list)
@@ -71,13 +69,8 @@ def parse(page: str) -> Guide:
                     section.rows.append((words(cells["cmd"]), words(cells.get("fn", "")), words(cells.get("note", ""))))
             if section.rows:
                 guide.sections.append(section)
-        elif "auto" in kinds:
-            guide.tasks_title = heading
-            for kind, marked, bare in re.findall(r'<div class="(colh|dim|gap)">(.*?)</div>|<div>(.*?)</div>', rest, flags=re.S):
-                if kind == "colh":
-                    guide.tasks.append((words(marked), []))
-                elif kind != "dim" and guide.tasks:  # 任务下方的小字只留在图片里
-                    guide.tasks[-1][1].append(words(marked or bare))
+        elif "auto" in kinds:  # 自动任务只留在图片里：文字版太长，群友也用不上
+            continue
         else:
             lines = [words(marked or bare) for _, marked, bare in re.findall(r'<div class="(dim)">(.*?)</div>|<div>(.*?)</div>', rest, flags=re.S)]
             guide.notes.append((heading, [line for line in lines if line]))
@@ -85,14 +78,8 @@ def parse(page: str) -> Guide:
 
 
 def overview(guide: Guide) -> str:
-    """第一条回复：机器人自动做的事，以及提示点按钮查看各分类。"""
-    out = [f"**{guide.heading}**", f"点下面的分类查看指令；「{PICTURE}」是全部内容的一张图。"]
-    if guide.tasks:
-        out += ["", f"**{guide.tasks_title or '自动任务'}**"]
-        for column, tasks in guide.tasks:
-            out.append(column)
-            out += [f"- {task}" for task in tasks]
-    return "\n".join(out)
+    """第一条回复：标题，以及提示点按钮查看各分类。"""
+    return "\n".join([f"**{guide.heading}**", f"点下面的分类查看指令；「{PICTURE}」是全部内容的一张图。"])
 
 
 def section_words(section: Section) -> str:
@@ -148,7 +135,7 @@ BACK = [("返回分类", MENU_COMMAND), (PICTURE, f"{MENU_COMMAND} {PICTURE}")]
 PLACEHOLDERS = ("名", "序号", "ID")  # 页面里表示“自己填”的词，如 /干员名、/战绩详情 ID
 PAUSED = ("暂停", "已暂停")
 HELP_COMMANDS = {MENU_COMMAND, "/skl帮助", "/help"}
-BARE_ANSWERS = {"/zmd导入小黑盒", "/mrfz导入小黑盒"}  # 要带参数，但不带参数发送时会回复用法：按钮发不带参数的指令
+BARE_ANSWERS = {"/导入小黑盒"}  # 要带参数，但不带参数发送时会回复用法：按钮发不带参数的指令
 
 
 def _bare(command: str) -> str:

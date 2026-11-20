@@ -12,7 +12,7 @@ from nonebot.typing import T_State
 
 def command_ends_cleanly(event: Event, state: T_State, glued: tuple[str, ...] = (), digits: bool = False) -> bool:
     """指令文字后面没有多余的字。glued：可以紧贴指令名的选项开头（小写，比较时不分大小写）；
-    digits：紧贴的数字也算（"/卫3"、"/zmd导入小黑盒12345678"）。"""
+    digits：紧贴的数字也算（"/卫3"、"/导入小黑盒12345678"）。"""
     message = event.get_message()
     if not message or message[0].type != "text":
         return True

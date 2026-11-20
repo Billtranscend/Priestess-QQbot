@@ -38,6 +38,7 @@ from nonebot_plugin_skland.db_handler import get_accounts, get_default_character
 from nonebot_plugin_skland.matcher import skland, skland_command
 from nonebot_plugin_skland.utils.message import send_reaction
 
+from plugins.shared import private_answer
 from plugins.skland_roles import owner_id_of
 
 __plugin_meta__ = PluginMetadata(
@@ -99,7 +100,7 @@ CONFLICTING_BUILTINS = (
     "森空岛解绑",
     "明日方舟签到",
     "方舟抽卡记录",
-    "导入抽卡记录",  # 本项目用 /mrfz导入小黑盒，与 /zmd导入小黑盒 一致
+    "导入抽卡记录",  # 本项目用 /导入小黑盒，一次补两款游戏
     "终末地签到",
     "终末地签到详情",
     "终末地全体签到",
@@ -231,17 +232,18 @@ _NEXT_STEP = re.compile("(" + "|".join(re.escape(c) for c in sorted(NEXT_STEPS, 
 
 
 _SENTENCE = re.compile(r"[^。；;！!？?\n]+")
-NOT_NOW = ("不要", "别", "如果", "私聊")  # 句子里有这些词：不是叫他现在在这里发（“收到通知前请先不要发”）
+NOT_NOW = ("不要", "别", "如果", "私聊")  # 指令前面有这些词：不是叫他现在在这里发（“收到通知前请先不要发”）
 
 
 def next_steps(text: str) -> list[str]:
-    """文字里叫成员现在发的 NEXT_STEPS 指令，按出现的顺序，不重复：指令前面同一句里要有“发”，
-    整句不能带 NOT_NOW 里的词。"""
+    """文字里叫成员现在发的 NEXT_STEPS 指令，按出现的顺序，不重复：同一句里指令前面要有“发”，
+    而且不能有 NOT_NOW 里的词。"""
     found = []
     for sentence in _SENTENCE.findall(text):
-        if any(word in sentence for word in NOT_NOW):
-            continue
-        found += [m.group(1) for m in _NEXT_STEP.finditer(sentence) if "发" in sentence[: m.start()]]
+        for m in _NEXT_STEP.finditer(sentence):
+            before = sentence[: m.start()]
+            if "发" in before and not any(word in before for word in NOT_NOW):
+                found.append(m.group(1))
     return list(dict.fromkeys(found))
 
 
@@ -268,6 +270,10 @@ async def no_default_words(game: str, user_id: str | None) -> str:
 
 @OneBotV11Bot.on_calling_api
 async def _rewrite_upstream_hints(bot, api: str, data: dict[str, Any]) -> None:
+    # 各钩子是同时运行的：回复发到哪里（群里的绑定二维码私聊发给本人）要在任何 await 之前定下，
+    # 下面的按钮消息也就跟着发到同一个地方
+    if (answer := private_answer.get()) is not None:
+        answer.route(api, data)
     if api not in ("send_msg", "send_group_msg", "send_private_msg"):
         return
     message = data.get("message")
@@ -350,7 +356,7 @@ async def _(bot: AnyBot, event: Event) -> None:
 # 上游留下、本项目不用的指令：完全不回应（不回答，也不交给上游）。排在上游的 matcher（优先级 1）之前。
 #  - 群友手打的 /sk、/skland 原始写法（每个功能都有中文指令；中文指令和按钮在内部展开成原始写法，不受影响）；
 #  - 对谁都关掉的：不带子指令的 /sk（上游旧角色卡，已由 /mrfz开盒 取代）、--help、garrison（/卫）、
-#    efwar（/战争回响、/回响竞速）、efcard（/zmd开盒）、import（上游按导出链接导入；方舟抽卡改由 /mrfz导入小黑盒
+#    efwar（/战争回响、/回响竞速）、efcard（/zmd开盒）、import（上游按导出链接导入；方舟抽卡由 /导入小黑盒
 #    按小黑盒 ID 导入，plugins.heybox_import）；
 #  - 依赖插件自带的 /user、/bind（把两个账号合并成同一个用户，会共用森空岛绑定）、/argot；
 #  - 只有超级用户能用的维护指令，别人发了也不回应（上游会回一句“仅超管可用”）。

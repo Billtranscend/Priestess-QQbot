@@ -193,9 +193,9 @@ def _pool_events(
         ours = Counter((o.name, o.ts) for o in paid if o.rarity == 6)
         theirs = Counter((e["name"], e["ts"]) for e in entries if e["ts"] >= first_ts)
         if theirs - ours:
-            return [], "与机器人已有的官方记录对不上"
+            return [], "与我这里已有的官方记录对不上"
         if ours - theirs:
-            return [], "小黑盒的数据比机器人已有的旧，请先在小黑盒里更新后再导入"
+            return [], "小黑盒的数据比我这里已有的旧，请先在小黑盒里更新后再导入"
         older = [e for e in entries if e["ts"] < first_ts]
         overlap = [e for e in entries if e["ts"] >= first_ts]
         if overlap:
@@ -206,7 +206,7 @@ def _pool_events(
         else:
             missing = pity - len(paid)
         if missing < 0:
-            return [], "小黑盒的数据比机器人已有的旧，请先在小黑盒里更新后再导入"
+            return [], "小黑盒的数据比我这里已有的旧，请先在小黑盒里更新后再导入"
         prev = None
         for entry in older:
             _segment(events, entry, int(entry["diff"]) - 1, prev, weapon)
@@ -241,7 +241,7 @@ def build_plan(result: dict, uid: str, official: list[Official], pool_windows: d
         )
         return plan
     if str(result["user_info"].get("uid")) != str(uid):
-        plan.error = "这个小黑盒账号绑定的终末地 UID 与你在机器人绑定的不一致，不能导入别人的记录"
+        plan.error = "这个小黑盒账号绑定的终末地 UID 与你在我这里绑定的不一致，不能导入别人的记录"
         return plan
 
     plan.official_pulls = sum(1 for row in official if not row.is_free)

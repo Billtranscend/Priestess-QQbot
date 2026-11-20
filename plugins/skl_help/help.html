@@ -186,6 +186,7 @@ td.note { color: var(--ef-sub); font-size: 18px; }
       <tr><td class="cmd"><code>/skl角色</code></td><td class="fn">查看已绑定的账号、角色和序号</td><td class="at"><span class="no">否</span></td><td class="note">标有「插件默认」的是指令默认使用的角色</td></tr>
       <tr><td class="cmd"><code>/skl切换终末地角色 序号</code></td><td class="fn">更换默认使用的角色</td><td class="at"><span class="no">否</span></td><td class="note">方舟用 <code>/skl切换方舟角色 序号</code></td></tr>
       <tr><td class="cmd"><code>指令 角色序号</code></td><td class="fn">临时查看另一个角色（序号见 <code>/skl角色</code>）</td><td class="at"><span class="no">否</span></td><td class="note">如 <code>/zmd抽卡记录 角色2</code>；<code>/理智</code>只看默认角色</td></tr>
+      <tr><td class="cmd"><code>/导入小黑盒 小黑盒ID</code></td><td class="fn">从小黑盒补回两款游戏更早的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">只能导入与自己绑定 UID 相同的小黑盒账号；小黑盒里没有的游戏自动跳过</td></tr>
       <tr><td class="cmd"><code>/skl解绑</code></td><td class="fn">解绑自己的森空岛账号</td><td class="at"><span class="no">否</span></td><td class="note">按提示选账号序号或「全部」，再回复「确认」；会删除角色和抽卡记录</td></tr>
     </table>
   </div>
@@ -199,7 +200,6 @@ td.note { color: var(--ef-sub); font-size: 18px; }
       <tr><td class="cmd"><code>/zmd签到详情</code></td><td class="fn">查看自己的签到状态</td><td class="at"><span class="no">否</span></td><td class="note">只能查询自己<!--napcat-->；<code>/签到详情</code> 两款游戏一起看<!--/napcat--></td></tr>
       <tr><td class="cmd"><code>/zmd抽卡记录</code></td><td class="fn">查看已保存的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">每天 01:00 自动更新<!--napcat-->；后面加 <code>限定池</code> / <code>武器池</code> / <code>其他卡池</code> 只看一类<!--/napcat--></td></tr>
       <tr><td class="cmd"><code>/zmd抽卡记录更新</code></td><td class="fn">立即拉取最新抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">想马上看到新记录时使用</td></tr>
-      <tr><td class="cmd"><code>/zmd导入小黑盒 小黑盒ID</code></td><td class="fn">从小黑盒补回更早的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">只能导入与自己绑定 UID 相同的小黑盒账号</td></tr>
       <tr><td class="cmd"><code>/zmd欧非榜</code></td><td class="fn">全部绑定用户的欧非榜前 10 和后 10 名，不分群</td><td class="at"><span class="no">否</span></td><td class="note">群聊、私聊均可；发 <code>/zmd欧非榜 退出</code> 可不上榜</td></tr>
       <tr><td class="cmd"><code>/角色欧非榜</code></td><td class="fn">角色池欧非榜，不分群</td><td class="at"><span class="no">否</span></td><td class="note">人多时只列前 150 名和后 150 名</td></tr>
       <tr><td class="cmd"><code>/武器欧非榜</code></td><td class="fn">武器池欧非榜，不分群</td><td class="at"><span class="no">否</span></td><td class="note">人多时只列前 150 名和后 150 名</td></tr>
@@ -243,7 +243,6 @@ td.note { color: var(--ef-sub); font-size: 18px; }
       <tr><td class="cmd"><code>/mrfz签到详情</code></td><td class="fn">查看自己的签到状态</td><td class="at"><span class="no">否</span></td><td class="note">只能查询自己<!--napcat-->；<code>/签到详情</code> 两款游戏一起看<!--/napcat--></td></tr>
       <tr><td class="cmd"><code>/mrfz抽卡记录</code></td><td class="fn">查看已保存的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">每天 01:00 自动更新<!--napcat-->；记录多时按年份分页（第 1 页最新），后面加 <code>第N页</code> 看其他页<!--/napcat--></td></tr>
       <tr><td class="cmd"><code>/mrfz抽卡记录更新</code></td><td class="fn">立即拉取最新抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note"></td></tr>
-      <tr><td class="cmd"><code>/mrfz导入小黑盒 小黑盒ID</code></td><td class="fn">从小黑盒补回更早的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">只能导入与自己绑定 UID 相同的小黑盒账号</td></tr>
       <tr><td class="cmd"><code>/方舟干员</code></td><td class="fn">干员一览，可追加筛选词</td><td class="at"><span class="yes">是</span></td><td class="note">例：<code>/方舟干员 6星 近卫</code></td></tr>
       <tr><td class="cmd"><code>/树海肉鸽</code></td><td class="fn">查看肉鸽战绩（黑流树海）</td><td class="at"><span class="yes">是</span></td><td class="note">另有 界园 / 萨卡兹 / 萨米 / 水月 / 傀影肉鸽</td></tr>
       <tr><td class="cmd"><code>/战绩详情 ID</code></td><td class="fn">查看单局肉鸽战绩详情</td><td class="at"><span class="no">否</span></td><td class="note">收藏的战绩用 <code>/收藏战绩详情 ID</code></td></tr>

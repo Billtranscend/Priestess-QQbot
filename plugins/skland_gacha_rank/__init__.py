@@ -494,10 +494,22 @@ def _mine(board: Board, ranked: list[Entry], entries: list[Entry], requester: st
     if pos is None:
         return f"<div>{label}<em>UP 不足 {MIN_UP} {board.measure}，暂未上榜</em></div>"
     me = ranked[pos - 1]
+    luck = board.luck(ranked)
+    mine = luck.of(board.avg(me), board.count(me))
     return (
-        f"<div>{label}第 <b>{pos}</b> / <i>{len(ranked)}</i> 名，欧气 <b>{luck_text(board.luck(ranked).of(board.avg(me), board.count(me)))}</b>，"
-        f"平均 <b>{board.avg(me):.1f}</b> 抽出{board.target}（共 <i>{board.count(me)}</i> {board.measure}）</div>"
+        f"<div>{label}第 <b>{pos}</b> / <i>{len(ranked)}</i> 名，欧气 <b>{luck_text(mine)}</b>，"
+        f"平均 <b>{board.avg(me):.1f}</b> 抽出{board.target}（共 <i>{board.count(me)}</i> {board.measure}）{_beats(board, ranked, luck, me, mine)}</div>"
     )
+
+
+def _beats(board: Board, ranked: list[Entry], luck: Luck, me: Entry, mine: float) -> str:
+    """“，比 x% 的人欧”：榜上其他人里欧气比查询者低的占比，保留一位小数（向下取）；榜上只有他一人时为空。"""
+    others = [e for e in ranked if e is not me]
+    if not others:
+        return ""
+    lower = sum(luck.of(board.avg(e), board.count(e)) < mine for e in others)
+    tenths = lower * 1000 // len(others)
+    return f"，比 <b>{tenths // 10}.{tenths % 10}%</b> 的人欧"
 
 
 def _average(board: Board, ranked: list[Entry]) -> float:

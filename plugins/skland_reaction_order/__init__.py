@@ -2,7 +2,8 @@
 
 上游一渲染完图片就给成员的指令回应“喝彩”，然后才开始上传。上传可能要一分钟，
 所以成员早早看到“完成”，东西却迟迟不到。这里把表情回应压住，直到指令的下一条消息（图片、
-文字或转发卡片）发送出去。之后什么都不发的指令在结束时得到回应；发送失败的，就完全不显示“完成”。
+文字或转发卡片）发送出去。发送失败的那次不算，等下一条送达的（例如改发到别处的那条）；之后什么都不发的
+指令在结束时得到回应；因发送失败而出错结束的，就完全不显示“完成”。
 
 每个导入了 `send_reaction` 的模块都持有自己的引用，所以等所有插件加载完后，再把替换版放进
 每个模块里；site-packages 不动。
@@ -55,11 +56,11 @@ send_reaction._after_delivery = True
 
 @Bot.on_called_api
 async def _react_once_delivered(bot: Bot, exception: Exception | None, api: str, data: dict, result) -> None:
-    if api not in SEND_APIS:
+    if api not in SEND_APIS or exception is not None:  # 失败的发送可能被别的钩子改发成功，“完成”留给那一条
         return
     matcher = current_matcher.get(None)
     user_session = _held.pop(id(matcher), None) if matcher is not None else None
-    if user_session is not None and exception is None:
+    if user_session is not None:
         _original(user_session, "done")  # 还在指令里面：用上游自己的方式发送
 
 

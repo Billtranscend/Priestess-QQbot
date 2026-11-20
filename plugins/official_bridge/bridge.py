@@ -47,9 +47,9 @@ from .idmap import GROUP_BASE, SELF, IdMap
 
 GROUP, C2C = "group", "c2c"
 
-# 被动回复：（收到的消息在多少秒内可以回复，每条消息可回复几次）。比文档写的 5 分钟 x 5 次和
-# 60 分钟 x 4 次略少一点，免得上传慢时越过界限。
-PASSIVE = {GROUP: (270, 5), C2C: (3500, 4)}
+# 被动回复：（收到的消息在多少秒内可以回复，每条消息可回复几次）。比文档写的 60 分钟 x 5 次（群）和
+# 60 分钟 x 4 次（私聊）略少一点，免得上传慢时越过界限。群原来是 5 分钟，平台 2026-11 改成了 60 分钟。
+PASSIVE = {GROUP: (3500, 5), C2C: (3500, 4)}
 INLINE_UPLOAD_MAX = 6 * 1024 * 1024  # 更大的文件走分片上传
 URL_REFUSED = 40_054_010
 # 在群里 @全体成员：平台自己的标记，用在文字消息里，仅限身为群管理员的机器人，每个群每天一次
@@ -245,6 +245,7 @@ class Inbound:
     ref_idx: str | None = None  # 引用它时所指向的引用标识
     taken_for: int | None = None  # 另一个机器人听到的那条消息，这条已被判定为它在平台上的副本
     event: bool = False  # 不是消息，而是一个可以回复的事件（成员添加了机器人）；这时 msg_id 是事件的 id
+    private_refused: bool = False  # 用私聊回复这条群消息被平台拒过（多半对方不是机器人好友）：不再试
 
     def usable(self) -> bool:
         ttl, limit = PASSIVE[self.kind]
@@ -592,7 +593,7 @@ class Bridge:
     # ------------------------------------------------------------------ 发送
 
     def _name_of(self, uid: int, group_openid: str | None) -> str:
-        openid = self.idmap.user_openid(uid) if group_openid else None
+        openid = (self.idmap.user_openid(uid) or self.idmap.former_openid(uid)) if group_openid else None  # 刚被认领的成员：事件里还是旧编号
         if openid and group_openid:
             row = self.idmap.member(group_openid, openid)
             if row and row["nickname"]:
@@ -813,6 +814,10 @@ class Bridge:
                 continue
             if kind != GROUP or item.author == uid or (text and item.text == text and time.time() - item.at < 30):
                 return item
+        if kind == C2C and current and current.kind == GROUP and not current.event and not current.private_refused and current.usable():
+            if openid in (self.idmap.user_openid(current.author), self.idmap.former_openid(current.author)):
+                # 正在处理这位成员的群消息：平台允许用私聊回复它（对方得是机器人好友），次数和群里的回复共用
+                return current
         return None
 
     async def _await_copy(self, openid: str) -> None:
@@ -938,16 +943,25 @@ class Bridge:
             if inbound is not None:
                 inbound.used += 1
                 # 回复 @ 了机器人的消息时，平台不会自动 @ 发消息的人（在群里实测过）：插件写的 @ 照样发
+                age = int(time.time() - inbound.at)
                 try:
-                    return await send_as(payload, inbound)
+                    sent = await send_as(payload, inbound)
+                    if inbound.kind != kind:
+                        logger.info("official bridge: a group message answered in private")
+                    if age >= 300:
+                        logger.info(f"official bridge: passive reply accepted {age}s after the message")
+                    return sent
                 except Exception as e:
                     if getattr(e, "code", None) == URL_REFUSED:
                         raise
                     if not isinstance(e, QQActionFailed):
                         # 网络超时、送审中：消息可能已经发出去了。再主动发一遍会重复，交给调用方当作失败
                         raise
-                    inbound.used = PASSIVE[kind][1]  # 平台拒绝了这次回复：这条消息不能再回复了
-                    logger.debug(f"official bridge: passive reply refused ({getattr(e, 'code', type(e).__name__)}), sending unprompted")
+                    if inbound.kind != kind:
+                        inbound.private_refused = True  # 用私聊回复群消息被拒：这条消息不再试私聊，群里照常能回复
+                    else:
+                        inbound.used = PASSIVE[kind][1]  # 平台拒绝了这次回复：这条消息不能再回复了
+                    logger.info(f"official bridge: passive reply refused ({getattr(e, 'code', type(e).__name__)}) {age}s after the message, sending unprompted")
             _was_reply.set(False)
             await self._pace(kind, openid)
             return await send_as(payload, None)
@@ -1123,7 +1137,10 @@ class Bridge:
             try:
                 return str((await self.qq.post_c2c_messages(**body, **inbound.attachment())).id or "")
             except Exception as e:
-                inbound.used = PASSIVE[C2C][1]  # 这条不能再回复了
+                if inbound.kind != C2C:
+                    inbound.private_refused = True  # 挂的是群消息：只是不再用私聊回复它
+                else:
+                    inbound.used = PASSIVE[C2C][1]  # 这条不能再回复了
                 logger.info(f"official bridge: suggested commands were refused as an answer ({getattr(e, 'code', None) or type(e).__name__}); sent unprompted")
         await self._pace(C2C, openid)
         return str((await self.qq.post_c2c_messages(**body)).id or "")

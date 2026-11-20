@@ -6,17 +6,22 @@
 - tell_superusers：私聊告诉每个超级用户一件事；
 - bot_left_group：通知是“机器人自己不在这个群了”（被移出，或群已解散），各插件据此清掉该群的数据；
 - upload_timed_out 和 SLOW_UPLOAD：发图失败其实只是 NapCat 上传慢，回这句话而不是“生成失败”；
-- heybox_hint：抽卡记录页面上提醒成员可以从小黑盒补全更早的记录。
+- heybox_hint：抽卡记录页面上提醒成员可以从小黑盒补全更早的记录；
+- private_answer：群里的一条指令正把回复私聊发给本人（plugins/skland_bind_sign 设，skland_shortcuts 的发送钩子照着改发送对象）。
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 from nonebot.adapters import Event
+
+
+private_answer: ContextVar[Any] = ContextVar("private_answer", default=None)  # 有 route(api, data) 方法的对象
 
 
 def bot_left_group(event: Event) -> bool:
@@ -93,8 +98,8 @@ async def tell_superusers(text: str, who: str) -> None:
             logger.warning(f"{who}: a superuser could not be told ({type(e).__name__})")
 
 
-HEYBOX_HINT = "官方接口只提供近期记录，如果你在小黑盒有更早的抽卡记录，可发送 {commands} 补全"
-HEYBOX_IMPORTS = {"endfield": "/zmd导入小黑盒 小黑盒ID", "arknights": "/mrfz导入小黑盒 小黑盒ID"}
+HEYBOX_IMPORT = "/导入小黑盒 小黑盒ID"  # 一次补两款游戏
+HEYBOX_HINT = f"官方接口只提供近期记录，如果你在小黑盒有更早的抽卡记录，可发送 {HEYBOX_IMPORT} 补全"
 HEYBOX_GAP_DAYS = 30  # 建号之后这么久还没有一条官方记录，才算可能缺了早期的抽卡（新玩家建号当天就会抽新手池）
 HEYBOX_HINT_TIMES = 3  # 每个角色最多提醒几次：没用过小黑盒的老玩家不会一直被提醒
 HEYBOX_HINTS_FILE = Path(__file__).resolve().parents[1] / "data" / "shared" / "heybox_hints.json"
@@ -121,4 +126,4 @@ def heybox_hint(earliest: int | None, imported: bool, app_code: str, created: fl
     with contextlib.suppress(OSError):
         HEYBOX_HINTS_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_json(HEYBOX_HINTS_FILE, shown)
-    return HEYBOX_HINT.format(commands=HEYBOX_IMPORTS[app_code])
+    return HEYBOX_HINT
