@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# 密钥和运行时数据，不要提交
+.env
+.env.*
+!.env.example
+data/
+cache/
+config/
+backups/
+
+# 只在本机用的插件，bot.py 会自动加载这里的包
+local_plugins/

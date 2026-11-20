@@ -1,0 +1,37 @@
+# 机器人的 systemd 单元。仓库里的这份不要直接改，不然以后 git pull 可能会被拒绝。复制过去，改复制出来的那份：
+#   sudo cp deploy/nonebot.service.example /etc/systemd/system/nonebot.service
+#   sudo nano /etc/systemd/system/nonebot.service
+# 把 User/Group 换成你的，没装在 /opt/priestess-qqbot 的把路径也换掉，然后：
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nonebot
+#
+# User/Group 填拥有 /opt/priestess-qqbot、执行过 `.venv/bin/playwright install chromium` 的那个用户
+# （docs/deploy-official.md 第 3 步）。浏览器装在这个用户的 ~/.cache/ms-playwright 下，换别的用户运行就找不到它，
+# 机器人启动时退出，日志里是 "Playwright environment is not set up correctly"。
+# 想把浏览器放在别处，安装时设好 PLAYWRIGHT_BROWSERS_PATH，再把下面同样的值去掉注释。手动启动时也要设。
+[Unit]
+Description=Priestess QQbot (NoneBot2)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/priestess-qqbot
+Environment=PYTHONUNBUFFERED=1
+Environment=ENVIRONMENT=prod
+# nonebot-plugin-skland 用进程本地时间格式化日期，按北京时间写
+Environment=TZ=Asia/Shanghai
+# Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/priestess-qqbot/data/nonebot_plugin_htmlrender
+ExecStart=/opt/priestess-qqbot/.venv/bin/python /opt/priestess-qqbot/bot.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/priestess-qqbot
+
+[Install]
+WantedBy=multi-user.target
