@@ -1212,8 +1212,8 @@ class Bridge:
     async def api_send_card(self, text: Any = "", rows: Any = None, group_id: Any = None, user_id: Any = None, mention: Any = None, **_: Any) -> dict:
         """不是 OneBot 调用：一行文字，下面带几排指令按钮（见 send_card）。
 
-        rows：由 [按钮上的字, 点击后发出的指令] 组成的列表。插件通过 plugins/quick_buttons.py 请求，
-        它只对本机器人这样做。mention：在群里开头 @ 这位成员（QQ 号或编号）。
+        rows：由 [按钮上的字, 点击后发出的指令] 组成的列表，插件通过 plugins/quick_buttons.py 请求。
+        mention：在群里开头 @ 这位成员（QQ 号或编号）。
         """
         kind, openid = (GROUP, self._group(group_id)) if group_id else (C2C, self._user(user_id))
         buttons = [[(str(label), str(command)) for label, command in row] for row in rows or [] if row]
@@ -1232,7 +1232,7 @@ class Bridge:
     async def api_send_hints(self, text: Any = "", commands: Any = None, user_id: Any = None, group_id: Any = None, **_: Any) -> dict:
         """不是 OneBot 调用：一条下面带指令、点一下即发送的私聊消息（见 send_hints）。
 
-        插件通过 plugins/quick_buttons.py 请求，它只对本机器人这样做。
+        插件通过 plugins/quick_buttons.py 请求。
         """
         wanted = [str(command).strip() for command in commands or [] if str(command).strip()]
         if group_id or user_id is None or not wanted:
