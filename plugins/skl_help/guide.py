@@ -1,9 +1,8 @@
 """文字版帮助页：在图片不是最好的第一回复时，/skl帮助 用它来回答。
 
-图片包含全部内容，但要几秒才能发到会话里。在能给消息挂按钮的机器人上（官方机器人），
-/skl帮助 先说明自动运行的功能，并把页面的各分类做成按钮；点开分类就是该分类指令的文字说明，
-图片本身也是一个按钮。所有内容都从本部署对应的 help.html 读取（render.page）：
-指令只在一个地方写。
+图片包含全部内容，但要几秒才能发到会话里，所以 /skl帮助 先说明自动运行的功能，并把页面的各分类
+做成按钮；点开分类就是该分类指令的文字说明，图片本身也是一个按钮。所有内容都从本部署对应的
+help.html 读取（render.page）：指令只在一个地方写。
 
 这里不导入 NoneBot：纯文本处理，测试会单独加载它。
 """
@@ -98,14 +97,6 @@ def notes_words(guide: Guide) -> str:
     return "\n".join(out).strip()
 
 
-def navigation(guide: Guide, shown: str) -> str:
-    """显示不了按钮时，分类文字的最后一行：代替「返回分类」「完整帮助图」两个按钮。"""
-    others = [section.title for section in guide.sections if section.title != shown]
-    if (guide.notes or guide.alias) and shown != NOTES:
-        others.append(NOTES)
-    return f"其他分类：{'、'.join(others)}（发 {MENU_COMMAND} 分类名）；完整帮助图发 {MENU_COMMAND}"
-
-
 def plain(text: str) -> str:
     """同样的文字，给不显示 markdown 的会话用。"""
     return text.replace("**", "")
@@ -179,24 +170,19 @@ def section_buttons(section: Section) -> list[tuple[str, str]]:
     return [(_bare(command), _bare(command)) for command, does, _ in section.rows if tappable(command, does)] + BACK
 
 
-def _ended(guide: Guide, text: str, shown: str, buttons: bool) -> str:
-    return text if buttons else f"{text}\n{navigation(guide, shown)}"
-
-
-def answer(guide: Guide, asked: str, buttons: bool) -> tuple[str, list[tuple[str, str]]] | None:
+def answer(guide: Guide, asked: str) -> tuple[str, list[tuple[str, str]]] | None:
     """对后面跟着 `asked` 的 /skl帮助 该说什么，以及下面挂的按钮；该发图片时返回 None。
 
-    指名要图片时发图片；没有按钮的机器人收到不带参数的 /skl帮助 时也照旧发图片。
-    分类和使用须知在任何机器人上都是文字；没有按钮时末尾加一行 navigation。
+    指名要图片、或者页面里没有分类时发图片；分类和使用须知是文字，不带参数时是总览和分类按钮。
     """
     asked = asked.strip()
     if asked in PICTURE_WORDS:
         return None
     if asked in NOTES_WORDS and (guide.notes or guide.alias):
-        return _ended(guide, notes_words(guide), NOTES, buttons), BACK
+        return notes_words(guide), BACK
     section = find(guide, asked)
     if section is not None:
-        return _ended(guide, section_words(section), section.title, buttons), section_buttons(section)
-    if not buttons or not guide.sections:
+        return section_words(section), section_buttons(section)
+    if not guide.sections:
         return None
     return overview(guide), menu(guide)

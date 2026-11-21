@@ -28,7 +28,6 @@ require("plugins.endfield_guide")
 from plugins import endfield_guide as guide
 from plugins import ef_theme
 from plugins import endfield_wiki as wiki
-from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, react as _react
 
 __plugin_meta__ = PluginMetadata(
     name="Weekly tasks",
@@ -199,12 +198,9 @@ async def _(bot: Bot, arg: Message = CommandArg()) -> None:
     action = arg.extract_plain_text().strip()
     if action:
         await tasks_command.finish("直接发 /本周任务 就行，后面不用加别的")
-    await _react(REACTION_PROCESSING)
     try:
         image = await build_tasks()
     except Exception as e:
         logger.warning(f"Weekly tasks page failed: {type(e).__name__}")
-        await _react(REACTION_FAIL)
         await tasks_command.finish("本周任务生成失败，请稍后再试")
     await tasks_command.send(MessageSegment.image(image))
-    await _react(REACTION_DONE)

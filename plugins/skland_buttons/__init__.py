@@ -1,4 +1,4 @@
-"""在 nonebot-plugin-skland 部分自带指令之后加按钮（能显示按钮的机器人，plugins/quick_buttons.py）。
+"""在 nonebot-plugin-skland 部分自带指令之后加按钮（plugins/quick_buttons.py）。
 
   肉鸽战绩（/树海肉鸽 ...）   其他主题，一点即查
   /方舟干员                  职业和 6星，作为筛选
@@ -7,8 +7,8 @@
   /skl切换终末地角色         不带序号发送时（选完游戏发出的就是这个）：列出该游戏的角色
 
 指令本身是上游的，不做改动：一个发送钩子记下指令已经发出了图片，指令结束后再跟上按钮。
-以提示结束的指令（没绑定、什么都没查到）不加按钮。显示不了按钮的机器人上，只有不带序号的切换指令
-改用文字列出角色；图片后面什么都不跟（这些指令帮助里都有，/skl角色 的卡片下面也留着教切换的两行字）。
+以提示结束的指令（没绑定、什么都没查到）不加按钮。按钮发不出时，只有不带序号的切换指令改用文字
+列出角色；图片后面什么都不跟（这些指令帮助里都有）。
 """
 
 from __future__ import annotations
@@ -27,14 +27,13 @@ require("nonebot_plugin_skland")
 
 from nonebot_plugin_alconna.consts import ALCONNA_RESULT
 from nonebot_plugin_orm import get_session
-from nonebot_plugin_skland.db_handler import get_default_character, get_user_characters
 
-from plugins.quick_buttons import Button, Rows, can_show_buttons, plain, rows_fit, rows_of, send_buttons
-from plugins.skland_roles import owner_id_of
+from plugins.quick_buttons import Button, Rows, plain, rows_fit, rows_of, send_buttons
+from plugins.skland_roles import other_roles, owner_id_of
 
 __plugin_meta__ = PluginMetadata(
     name="Skland buttons",
-    description="在能显示按钮的机器人上，给肉鸽战绩、方舟干员、角色列表加快捷按钮。",
+    description="给肉鸽战绩、方舟干员、角色列表加快捷按钮。",
     usage="无指令，自动生效。",
     type="application",
 )
@@ -96,14 +95,8 @@ async def switchable(owner: int | None) -> dict[str, list[Role]]:
         return games
     async with get_session() as session:
         for app_code in GAMES:
-            roles = await get_user_characters(owner, app_code, session)
-            if len(roles) < 2:
-                continue
-            default = await get_default_character(owner, app_code, session)
-            # 角色的序号就是它在这个列表里的位置，和卡片上、切换指令里的一致
-            others = [(number, role.nickname) for number, role in enumerate(roles, 1) if default is None or role.id != default.id]
-            if others:
-                games[app_code] = others
+            if others := await other_roles(session, owner, app_code):
+                games[app_code] = [(number, role.nickname) for number, role in others]
     return games
 
 
@@ -119,7 +112,7 @@ def game_offer(app_code: str, roles: list[Role]) -> tuple[str, Rows]:
 
 
 def roles_in_words(app_code: str, games: dict[str, list[Role]]) -> str:
-    """显示不了按钮时同样的选择：每个角色一行“序号. 昵称：指令”，另一个游戏也能切换时最后再给它的切换指令。"""
+    """按钮发不出时同样的选择：每个角色一行“序号. 昵称：指令”，另一个游戏也能切换时最后再给它的切换指令。"""
     name, command = GAMES[app_code]
     lines = [f"切换{name}默认角色，发送对应的指令：", *(f"{number}. {nickname}：{command} {number}" for number, nickname in games[app_code])]
     lines += [f"切换{other_name}角色：{other_command}" for other, (other_name, other_command) in GAMES.items() if other != app_code and other in games]
@@ -144,7 +137,7 @@ async def role_buttons(user_id: str) -> tuple[str, Rows] | None:
 
 async def offer_roles(app_code: str, owner: int | None, bot: BaseBot, event: Event) -> bool:
     """对没指定角色的切换指令，列出该游戏可以切换的角色作答：按钮，另一个游戏也能切换时再加一个去那边的按钮；
-    显示不了按钮（或按钮被拒）时是同样内容的文字（roles_in_words）。owner 是切换流程开头查到的成员 id。
+    按钮发不出时是同样内容的文字（roles_in_words）。owner 是切换流程开头查到的成员 id。
     成员没有别的角色可切换、或查不了时返回 False（什么都不发）。"""
     try:
         games = await switchable(owner)
@@ -161,16 +154,14 @@ async def offer_roles(app_code: str, owner: int | None, bot: BaseBot, event: Eve
 
 async def explain_switch(app_code: str, text: str, owner: int | None, bot: BaseBot, event: Event) -> bool:
     """切换做不了时的说明（plugins/skland_shortcuts），下面挂上另一个游戏可以切换的角色和“更新角色列表”。
-    owner 同 offer_roles。机器人不显示按钮时返回 False（什么都不发）。"""
-    if not can_show_buttons(bot):
-        return False
+    owner 同 offer_roles。按钮发不出时返回 False（什么都不发）。"""
     try:
         games = await switchable(owner)
     except Exception as e:
         logger.warning(f"Skland buttons: roles of the other game not offered ({type(e).__name__}: {e})")
         games = {}
     rows = [row for other, roles in games.items() if other != app_code for row in rows_fit(role_choices(other, roles))]
-    # 无文字兜底：说明文字里已经写了要发的指令；没有按钮时由 plugins/skland_shortcuts 带 @ 发这段文字
+    # 无文字兜底：说明文字里已经写了要发的指令；按钮发不出时由 plugins/skland_shortcuts 带 @ 发这段文字
     return await send_buttons(plain(text), [*rows, [("更新角色列表", "/skl角色更新")]], bot=bot, event=event)
 
 
@@ -189,7 +180,7 @@ async def _offer_buttons(matcher: Matcher, bot: BaseBot, event: Event, exception
     if id(matcher) not in _pictured:
         return
     _pictured.discard(id(matcher))
-    if exception is not None or not can_show_buttons(bot):
+    if exception is not None:
         return
     result = getattr(matcher.state.get(ALCONNA_RESULT), "result", None)
     if result is None:

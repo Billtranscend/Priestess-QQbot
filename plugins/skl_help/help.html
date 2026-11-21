@@ -139,12 +139,12 @@ td.note { color: var(--ef-sub); font-size: 18px; }
       <div class="colh">每周与不定时</div>
       <div class="gap"><span class="time">周一 04:00</span> 森空岛账号体检：登录失效、全部角色都无法签到，或本人既不在机器人所在任何群、也不是机器人好友的绑定会被自动解除</div>
       <div class="gap"><span class="time">活动开启时</span> 终末地、明日方舟有活动开启时在各群发送通知图，标明截止时间；0–8 点开启的活动在 8 点通知</div>
-      <!--official--><div class="dim">活动通知、资料库更新通知只发到群主已打开「机器人主动在群聊内发言」的群</div><!--/official-->
+      <div class="dim">活动通知、资料库更新通知只发到群主已打开「机器人主动在群聊内发言」的群</div>
       </div>
     </div>
   </div>
 
-  <!--official-->
+  
   <div class="ef-sec warn">
     <h3>使用须知</h3>
     <div class="cols">
@@ -161,7 +161,7 @@ td.note { color: var(--ef-sub); font-size: 18px; }
     </div>
   </div>
 
-  <!--/official-->
+  
 
   <div class="ef-sec warn">
     <h3>安全提醒</h3>
@@ -174,7 +174,7 @@ td.note { color: var(--ef-sub); font-size: 18px; }
 
   <div class="alias">
     指令前缀可互换：<b>zmd</b> = ef = 终末地　｜　<b>mrfz</b> = 方舟 = 明日方舟　｜　<b>skl</b> = skd = 森空岛<br>
-    例如 <b>/ef开盒</b> 和 <b>/zmd开盒</b> 效果相同，<b>/方舟签到</b> 和 <b>/mrfz签到</b> 效果相同<div class="legend">表格第三列：能否在指令后 @群友 查看对方（<span class="yes">是</span> 能，<span class="no">否</span> 只能用于自己，<span class="na">—</span> 不适用）<!--official--><br><span class="dim">@群友 只在群主把「机器人可获取的群聊消息范围」设为「获取群内全部消息」的群可用</span><!--/official--></div>
+    例如 <b>/ef开盒</b> 和 <b>/zmd开盒</b> 效果相同，<b>/方舟签到</b> 和 <b>/mrfz签到</b> 效果相同<div class="legend">表格第三列：能否在指令后 @群友 查看对方（<span class="yes">是</span> 能，<span class="no">否</span> 只能用于自己，<span class="na">—</span> 不适用）<br><span class="dim">@群友 只在群主把「机器人可获取的群聊消息范围」设为「获取群内全部消息」的群可用</span></div>
   </div>
 
   <div class="ef-sec sec acc">
@@ -194,13 +194,13 @@ td.note { color: var(--ef-sub); font-size: 18px; }
   <div class="ef-sec sec ef">
     <h3>终末地</h3>
     <table>
-      <tr><td class="cmd"><code>/zmd活动</code></td><td class="fn">终末地正在开放和即将开启的活动、卡池及截止时间</td><td class="at"><span class="na">—</span></td><td class="note">也可发 <code>/终末地活动</code> <code>/zmd日历</code>；<code>/活动</code> <!--official-->选一款或两款一起看<!--/official--><!--napcat-->同时看两款游戏<!--/napcat--></td></tr>
+      <tr><td class="cmd"><code>/zmd活动</code></td><td class="fn">终末地正在开放和即将开启的活动、卡池及截止时间</td><td class="at"><span class="na">—</span></td><td class="note">也可发 <code>/终末地活动</code> <code>/zmd日历</code>；<code>/活动</code> 选一款或两款一起看</td></tr>
       <tr><td class="cmd"><code>/zmd开盒</code></td><td class="fn">终末地角色卡：账号概况、据点和全部干员的练度</td><td class="at"><span class="yes">是</span></td><td class="note">加 @用户 可查看群友（对方需已在此绑定<!--migration-->或恢复绑定<!--/migration-->）；<code>角色序号</code> 看自己的其他角色</td></tr>
       <tr><td class="cmd"><code>/zmd签到</code></td><td class="fn">手动为自己的角色签到</td><td class="at"><span class="no">否</span></td><td class="note">每天 00:20 已自动签到</td></tr>
-      <tr><td class="cmd"><code>/zmd签到详情</code></td><td class="fn">查看自己的签到状态</td><td class="at"><span class="no">否</span></td><td class="note">只能查询自己<!--napcat-->；<code>/签到详情</code> 两款游戏一起看<!--/napcat--></td></tr>
-      <tr><td class="cmd"><code>/zmd抽卡记录</code></td><td class="fn">查看已保存的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">每天 01:00 自动更新<!--napcat-->；后面加 <code>限定池</code> / <code>武器池</code> / <code>其他卡池</code> 只看一类<!--/napcat--></td></tr>
+      <tr><td class="cmd"><code>/zmd签到详情</code></td><td class="fn">查看自己的签到状态</td><td class="at"><span class="no">否</span></td><td class="note">只能查询自己</td></tr>
+      <tr><td class="cmd"><code>/zmd抽卡记录</code></td><td class="fn">查看已保存的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">每天 01:00 自动更新</td></tr>
       <tr><td class="cmd"><code>/zmd抽卡记录更新</code></td><td class="fn">立即拉取最新抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">想马上看到新记录时使用</td></tr>
-      <tr><td class="cmd"><code>/zmd欧非榜</code></td><td class="fn">全部绑定用户的欧非榜前 10 和后 10 名，不分群</td><td class="at"><span class="no">否</span></td><td class="note">群聊、私聊均可；发 <code>/zmd欧非榜 退出</code> 可不上榜</td></tr>
+      <tr><td class="cmd"><code>/zmd欧非榜</code></td><td class="fn">全部绑定用户的欧非榜前 10 和后 10 名，不分群</td><td class="at"><span class="no">否</span></td><td class="note">群聊、私聊均可；发 <code>/zmd欧非榜 退出</code> 不上终末地的榜；<code>/欧非榜</code> 先选游戏，<code>/欧非榜 退出</code> 两款都不上榜</td></tr>
       <tr><td class="cmd"><code>/角色欧非榜</code></td><td class="fn">角色池欧非榜，不分群</td><td class="at"><span class="no">否</span></td><td class="note">人多时只列前 150 名和后 150 名</td></tr>
       <tr><td class="cmd"><code>/武器欧非榜</code></td><td class="fn">武器池欧非榜，不分群</td><td class="at"><span class="no">否</span></td><td class="note">人多时只列前 150 名和后 150 名</td></tr>
       <tr><td class="cmd"><code>/干员统计</code></td><td class="fn">全部绑定玩家的 6★ 干员持有率、平均潜能和高难出场率（不分群）</td><td class="at"><span class="na">—</span></td><td class="note">可加 关卡名 / 战争回响 / 影拓丰碑，只改出场率</td></tr>
@@ -238,11 +238,13 @@ td.note { color: var(--ef-sub); font-size: 18px; }
       <tr><td class="cmd"><code>/mrfz活动</code></td><td class="fn">明日方舟正在开放和即将开启的活动、卡池及截止时间</td><td class="at"><span class="na">—</span></td><td class="note">也可发 <code>/明日方舟活动</code> <code>/粥活动</code> <code>/舟日历</code></td></tr>
       <tr><td class="cmd"><code>/mrfz开盒</code></td><td class="fn">明日方舟角色卡：账号概况、助战、基建和全部干员的练度</td><td class="at"><span class="yes">是</span></td><td class="note">加 @用户 可查看群友（对方需已在此绑定<!--migration-->或恢复绑定<!--/migration-->）；<code>角色序号</code> 看自己的其他角色</td></tr>
       <tr><td class="cmd"><code>/卫</code></td><td class="fn">卫戍协议战绩：奖杯、场次、常用策略与盟约、六维评价、最近对局</td><td class="at"><span class="yes">是</span></td><td class="note">加 @用户 可查看群友；后面加 <code>全部</code> 看全部对局（<code>第2页</code> 翻页），<code>收藏</code> 看收藏的对局，第几局（如 <code>/卫 3</code>）看单局阵容；也可发 <code>/卫戍战绩</code> <code>/mrfz卫戍</code></td></tr>
-      <tr><td class="cmd"><code>/卫戍榜</code></td><td class="fn">卫戍协议奖杯榜，全部绑定用户，不分群</td><td class="at"><span class="no">否</span></td><td class="note">每天 10:30 刷新；发 <code>/卫戍榜 更新</code> 只更新自己（5 分钟一次），发 <code>/卫戍榜 退出</code> 可不上榜<!--napcat-->，<code>/卫戍榜 加入</code> 重新上榜<!--/napcat--></td></tr>
+      <tr><td class="cmd"><code>/卫戍榜</code></td><td class="fn">卫戍协议奖杯榜，全部绑定用户，不分群</td><td class="at"><span class="no">否</span></td><td class="note">每天 10:30 刷新；发 <code>/卫戍榜 更新</code> 只更新自己（5 分钟一次），发 <code>/卫戍榜 退出</code> 可不上榜</td></tr>
       <tr><td class="cmd"><code>/mrfz签到</code></td><td class="fn">手动为自己的角色签到</td><td class="at"><span class="no">否</span></td><td class="note">每天 00:15 已自动签到</td></tr>
-      <tr><td class="cmd"><code>/mrfz签到详情</code></td><td class="fn">查看自己的签到状态</td><td class="at"><span class="no">否</span></td><td class="note">只能查询自己<!--napcat-->；<code>/签到详情</code> 两款游戏一起看<!--/napcat--></td></tr>
-      <tr><td class="cmd"><code>/mrfz抽卡记录</code></td><td class="fn">查看已保存的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">每天 01:00 自动更新<!--napcat-->；记录多时按年份分页（第 1 页最新），后面加 <code>第N页</code> 看其他页<!--/napcat--></td></tr>
+      <tr><td class="cmd"><code>/mrfz签到详情</code></td><td class="fn">查看自己的签到状态</td><td class="at"><span class="no">否</span></td><td class="note">只能查询自己</td></tr>
+      <tr><td class="cmd"><code>/mrfz抽卡记录</code></td><td class="fn">查看已保存的抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note">每天 01:00 自动更新</td></tr>
       <tr><td class="cmd"><code>/mrfz抽卡记录更新</code></td><td class="fn">立即拉取最新抽卡记录</td><td class="at"><span class="no">否</span></td><td class="note"></td></tr>
+      <tr><td class="cmd"><code>/mrfz欧非榜</code></td><td class="fn">全部绑定用户的限定寻访欧非榜前 10 和后 10 名，不分群</td><td class="at"><span class="no">否</span></td><td class="note">群聊、私聊均可；发 <code>/mrfz欧非榜 退出</code> 不上明日方舟的榜</td></tr>
+      <tr><td class="cmd"><code>/mrfz限定欧非榜</code></td><td class="fn">限定寻访欧非榜，不分群</td><td class="at"><span class="no">否</span></td><td class="note">人多时只列前 150 名和后 150 名</td></tr>
       <tr><td class="cmd"><code>/方舟干员</code></td><td class="fn">干员一览，可追加筛选词</td><td class="at"><span class="yes">是</span></td><td class="note">例：<code>/方舟干员 6星 近卫</code></td></tr>
       <tr><td class="cmd"><code>/树海肉鸽</code></td><td class="fn">查看肉鸽战绩（黑流树海）</td><td class="at"><span class="yes">是</span></td><td class="note">另有 界园 / 萨卡兹 / 萨米 / 水月 / 傀影肉鸽</td></tr>
       <tr><td class="cmd"><code>/战绩详情 ID</code></td><td class="fn">查看单局肉鸽战绩详情</td><td class="at"><span class="no">否</span></td><td class="note">收藏的战绩用 <code>/收藏战绩详情 ID</code></td></tr>
@@ -254,7 +256,7 @@ td.note { color: var(--ef-sub); font-size: 18px; }
     <table>
       <tr><td class="cmd"><code>/本周任务</code></td><td class="fn">两款游戏的周常：方舟剿灭、周常任务、保全派驻，终末地每周事务、通行证周常</td><td class="at"><span class="na">—</span></td><td class="note"><!--migration-->不再定时推送，<!--/migration-->想看时发指令</td></tr>
       <tr><td class="cmd"><code>/理智</code></td><td class="fn">查看方舟和终末地当前理智</td><td class="at"><span class="no">否</span></td><td class="note">显示多久后回满</td></tr>
-      <tr><td class="cmd"><code>/skl帮助</code></td><td class="fn">显示本帮助图</td><td class="at"><span class="no">否</span></td><td class="note">也可发 <code>/帮助</code> <code>/help</code><!--napcat-->；<code>/帮助 分类名</code> 看某一类的文字版，如 <code>/帮助 终末地</code><!--/napcat--></td></tr>
+      <tr><td class="cmd"><code>/skl帮助</code></td><td class="fn">显示本帮助图</td><td class="at"><span class="no">否</span></td><td class="note">也可发 <code>/帮助</code> <code>/help</code></td></tr>
       <!--bison-->
       <tr><td class="cmd"><code>@机器人 /查询订阅</code></td><td class="fn">查看本群订阅的 B 站 UP 主</td><td class="at"><span class="na">—</span></td><td class="note">必须先 @机器人；所有人可用</td></tr>
       <tr><td class="cmd"><code>@机器人 /添加订阅</code></td><td class="fn">为本群添加 B 站 UP 主的动态或直播推送</td><td class="at"><span class="na">—</span></td><td class="note">仅群主、管理员；按提示选平台、填 UID 和推送类型</td></tr>

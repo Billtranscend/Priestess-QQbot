@@ -2,8 +2,8 @@
 
 /zmd活动   /终末地活动 /zmd日历 ...        终末地：正在开放和即将开放的活动，以及卡池
 /mrfz活动  /明日方舟活动 /粥活动 /舟日历 ... 明日方舟，内容同上
-/活动      /日历                            两款游戏；如果机器人能在消息下挂按钮（官方 QQ 机器人），
-                                            先让用户选：其中一款，或两款都看
+/活动      /日历                            两款游戏；先用按钮问看哪一款：其中一款，或两款都看；
+                                            按钮发不出时直接发两款
 /全部活动  /所有活动 /两款活动               两款游戏，不再询问
 /活动通知预览 [明日方舟]  （超级用户）        下一个将开放活动的通知，只发到当前会话
 
@@ -57,7 +57,7 @@ from plugins import endfield_wiki as wiki
 from plugins.endfield_wiki import data as wiki_data
 
 from . import arknights, themes
-from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, first_bot, write_json, react as _react
+from plugins.shared import first_bot, unprompted_refused, write_json
 from plugins.skland_pools import POOL_CONTENT_URL
 
 __plugin_meta__ = PluginMetadata(
@@ -484,9 +484,6 @@ def _quiet(now: datetime) -> bool:
     return QUIET_HOURS is not None and QUIET_HOURS[0] <= now.hour < QUIET_HOURS[1]
 
 
-UNPROMPTED_REFUSED = 40_034_105  # 平台：群里没开“机器人主动在群聊内发言”，重试也一样
-
-
 async def _broadcast(image: bytes) -> dict[str, int]:
     """把图发到每个群，不 @全体成员。不让机器人主动发言的群只试一次（refused），其他失败再试一次（fail）。"""
     stats = {"ok": 0, "refused": 0, "fail": 0}
@@ -504,7 +501,7 @@ async def _broadcast(image: bytes) -> dict[str, int]:
                 stats["ok"] += 1
                 break
             except Exception as e:
-                refused = getattr(e, "retcode", None) == UNPROMPTED_REFUSED
+                refused = unprompted_refused(e)
                 if refused:
                     stats["refused"] += 1
                     break
@@ -586,7 +583,7 @@ async def _first_refresh() -> None:
 
 
 def calendar_choice() -> tuple[str, list[list[tuple[str, str]]]]:
-    """能显示按钮时，两款游戏共用的指令提供的选项：单看某一款，或两款一起。"""
+    """两款游戏共用的指令先用按钮问的选项：单看某一款，或两款一起。"""
     return "**活动日历** 看哪一款？", [[("明日方舟：终末地", ENDFIELD.command), ("明日方舟", ARKNIGHTS.command)], [("一起看", f"/{BOTH_WORDS[0]}活动")]]
 
 
@@ -600,15 +597,14 @@ async def _drop(tasks: list[asyncio.Task]) -> None:
 @calendar_cmd.handle()
 async def _(words: dict = RegexDict()) -> None:
     named = [game for game in GAMES if words.get(game.key)]
-    # 没指明游戏：能用按钮时先问看哪个。日历本身就是最终回答，下面不再挂按钮。
-    # 无文字兜底：显示不了按钮时不用先问，下面直接发两款游戏的日历
+    # 没指明游戏：先用按钮问看哪个。日历本身就是最终回答，下面不再挂按钮。
+    # 无文字兜底：按钮发不出时不用先问，下面直接发两款游戏的日历
     if not named and not words.get("both") and await send_buttons(*calendar_choice()):
         await calendar_cmd.finish()
     asked = named or list(GAMES)
     ready = [game for game in asked if game.load()["activities"]]
     if not ready:
         await calendar_cmd.finish("活动数据还没有同步好，请稍后再试")
-    await _react(REACTION_PROCESSING)
     now = datetime.now(CN)
     drawing = [asyncio.create_task(calendar_picture(game, now)) for game in ready]  # 几张图一起画，按 ready 的顺序发
     try:
@@ -618,11 +614,9 @@ async def _(words: dict = RegexDict()) -> None:
         raise
     except Exception as e:
         logger.warning(f"Game calendar render failed: {type(e).__name__}")
-        await _react(REACTION_FAIL)
         await calendar_cmd.finish("活动日历生成失败，请稍后再试")
     finally:
         await _drop(drawing)
-    await _react(REACTION_DONE)
 
 
 @preview_cmd.handle()
@@ -634,7 +628,5 @@ async def _(arg: Message = CommandArg()) -> None:
     sample = [a for a in coming if a["start"] == coming[0]["start"]] if coming else open_now(items, now)[-1:]
     if not sample:
         await preview_cmd.finish("没有可预览的活动")
-    await _react(REACTION_PROCESSING)
     moment = max(now, sample[0]["start"])  # 显示成开放那一刻的样子
     await UniMessage.image(raw=await notice_picture(game, sample, moment)).send()
-    await _react(REACTION_DONE)

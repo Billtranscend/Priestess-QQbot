@@ -48,7 +48,6 @@ from nonebot_plugin_skland.schemas import CRED
 from nonebot_plugin_skland.schemas.arknights.card import ArkCard
 from nonebot_plugin_skland.services.auth import refresh_credentials
 from nonebot_plugin_user import UserSession, get_user
-from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, SLOW_UPLOAD, react as _react, upload_timed_out
 
 __plugin_meta__ = PluginMetadata(
     name="Arknights roster",
@@ -395,11 +394,9 @@ async def _(event: MessageEvent, user_session: UserSession, session: async_scope
         return
     user, character = selected
 
-    await _react(REACTION_PROCESSING)
     try:
         card = await _fetch_card(user, character)
         if not card:
-            await _react(REACTION_FAIL)
             await _keep_tokens(session)
             return
         await fill_avatars({c.charId for c in card.chars} | {c.charId for c in card.assistChars} | {card.status.secretary.charId})
@@ -413,15 +410,9 @@ async def _(event: MessageEvent, user_session: UserSession, session: async_scope
     except MatcherException:
         raise
     except Exception as e:
-        if upload_timed_out(e):  # 图已经做好，只是上传太久
-            logger.warning("Arknights roster: picture upload timed out")
-            await _keep_tokens(session)
-            await roster.finish(SLOW_UPLOAD)
         logger.opt(exception=e).warning(f"Arknights roster failed: {type(e).__name__}")
-        await _react(REACTION_FAIL)
         await _keep_tokens(session)
         await roster.finish("角色卡生成失败，请稍后再试")
-    await _react(REACTION_DONE)
     await _keep_tokens(session)
 
 

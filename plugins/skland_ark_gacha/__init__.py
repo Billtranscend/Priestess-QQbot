@@ -7,9 +7,9 @@
     /mrfz抽卡记录 第2页   记录需要好几张图时，只看其中一张（选项 -p）
 
 成员自己保存的记录按卡池开放的年份一年一张图，先发最新的一张；一年里卡池太多时再按月份平均切开
-（year_pages）。有好几张时图下方写着第几页、怎么看其他页（page_note）。能在消息下面挂按钮的机器人
-（官方 QQ 机器人，plugins/quick_buttons.py）上，其余每张图各有一个按钮（按钮上写年份或月份），另有
-一个按钮拉取最新记录（刚拉取过时没有）。看别人的记录、用 -b / -l 截取时一次画出（超过上限分成几张）。
+（year_pages）。有好几张时图下方写着第几页、怎么看其他页（page_note）。其余每张图各有一个按钮
+（按钮上写年份或月份），另有一个按钮拉取最新记录（刚拉取过时没有）。看别人的记录、用 -b / -l 截取时
+一次画出（超过上限分成几张）。
 
 此外，成员绑定的每个账号下的每个明日方舟角色每天同步一次，和终末地同在 01:00 这个时段
 （有自己的队列和 worker，用同一个 Queue 类）。官方 API 只保留有限时间内的抽卡记录，所以游戏
@@ -67,8 +67,8 @@ from nonebot_plugin_skland.utils.message import send_request_error
 from nonebot_plugin_user import UserSession, get_user
 
 from plugins.skland_auto_gacha.core import Queue, TZ
-from plugins.quick_buttons import can_show_buttons, plain, rows_fit, send_buttons
-from plugins.shared import SLOW_UPLOAD, heybox_hint, upload_timed_out
+from plugins.quick_buttons import plain, rows_fit, send_buttons
+from plugins.shared import heybox_hint
 from plugins.strict_command import strict
 
 __plugin_meta__ = PluginMetadata(
@@ -201,18 +201,13 @@ async def show_saved(user_session: UserSession, *args, **kwargs) -> None:
     except (MatcherException, SklandException, PageTimeout):
         raise
     except Exception as e:
-        if upload_timed_out(e):  # 图已经做好，只是上传太久
-            logger.warning("Arknights gacha page: picture upload timed out")
-            await UniMessage.text(SLOW_UPLOAD).send(reply_to=True)
-            return
         logger.warning(f"Arknights gacha page failed: {type(e).__name__}")
-        gacha_command.send_reaction(user_session, "fail")
         await UniMessage.text("抽卡记录图片生成失败，请稍后再试").send(reply_to=True)
 
 
 async def _after_page(labels: list[str], number: int, role: str, fetched: int | None, hint: str) -> None:
     """自己的记录的一张图之后：挂上其他各页和拉取最新记录的按钮，标题里写新增条数和小黑盒提示；
-    挂不了按钮（没有按钮的机器人、只有一张图又刚拉取过、按钮被拒）时，新增条数和提示改发文字。"""
+    挂不了按钮（只有一张图又刚拉取过、按钮被拒）时，新增条数和提示改发文字。"""
     title, rows = page_menu(labels, number, role, fetched)
     said = ([FETCHED.format(fetched)] if fetched is not None else []) + ([hint] if hint else [])
     # 无文字兜底：怎么看其他页已写在图下方（page_note），这里另发的只是新增条数和提示，不算菜单
@@ -242,12 +237,10 @@ async def _show_saved(
     if selected is None:  # 原因已经发给成员了
         return
     user, character = selected
-    gacha_command.send_reaction(user_session, "processing")
     records = await get_character_gacha_records(character.id, session)
     if not records:
         await session.rollback()
         await UniMessage.text(NO_RECORDS if fetched is None else NONE_FETCHED).send(reply_to=True)
-        gacha_command.send_reaction(user_session, "done")
         return
     character_id = character.id
     earliest, imported = min((r.gacha_ts for r in records), default=None), any((r.pos or 0) < 0 for r in records)  # 会话结束前先取出来
@@ -269,7 +262,7 @@ async def _show_saved(
     start, stop, _ = slice(first, last).indices(len(grouped.pools))  # 负数和越界的 -b / -l 按切片的规则换算
     shown = max(0, stop - start)
     asked_page = _page_requested()
-    # 成员自己的记录（没用 -b / -l）一次显示一张图，不管能不能挂按钮。
+    # 成员自己的记录（没用 -b / -l）一次显示一张图。
     by_year = not target.available and first is None and last is None
     if asked_page is not None or by_year:
         pages = [(label, start + b, start + e) for label, b, e in year_pages(grouped.pools[start:stop])] or [("", start, stop)]
@@ -280,12 +273,11 @@ async def _show_saved(
         role = f" 角色{role_index}" if role_index is not None else ""
         if len(pages) > 1 and not target.available:
             page = await _with_note(page, page_note(labels, number, role))
-        await UniMessage.image(raw=page).send(at_sender=by_year and not can_show_buttons())  # 官方机器人上由桥接点名
+        await UniMessage.image(raw=page).send()
         if by_year:
             await _after_page(labels, number, role, fetched, hint)
         elif hint:
             await UniMessage.text(hint).send()
-        gacha_command.send_reaction(user_session, "done")
         return
     if shown <= config.gacha_render_max:
         page = await render.render_gacha_history(grouped, card.status, nickname=nickname, channel_master_id=channel, begin=first, limit=last)
@@ -306,7 +298,6 @@ async def _show_saved(
         ).send()
     if hint:
         await UniMessage.text(hint).send()
-    gacha_command.send_reaction(user_session, "done")
 
 
 gacha_command.gacha_handler = show_saved  # 上游的 `skland gacha` 在运行时才导入它
@@ -332,7 +323,6 @@ async def _(user_session: UserSession, session: async_scoped_session, bot: Bot, 
     except (SklandException, httpx.HTTPError) as e:
         await session.rollback()
         logger.warning(f"Arknights gacha update failed: {type(e).__name__}")
-        gacha_command.send_reaction(user_session, "fail")
         await UniMessage.text(SYNC_FAILED).send(at_sender=True)
         return
     if fetched is not None:
@@ -353,10 +343,8 @@ async def _update(user_session: UserSession, session: async_scoped_session, role
     if not role.access_token:
         await UniMessage.text(NO_TOKEN).send(at_sender=True)
         return None
-    gacha_command.send_reaction(user_session, "processing")
     added = await _save(owner_id, role, await _pull(role, await SklandLoginAPI.get_grant_code(role.access_token, 1)))
     if isinstance(added, str):  # 拉取期间解绑了，或者换了账号
-        gacha_command.send_reaction(user_session, "fail")
         await UniMessage.text(SYNC_FAILED).send(at_sender=True)
         return None
     logger.info(f"Arknights gacha update: {added} new records")

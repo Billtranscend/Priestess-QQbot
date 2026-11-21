@@ -58,7 +58,7 @@ REFRESH_WAIT = 60  # /竞速更新 排在别人的个人更新后面时最多等
 def people(binds: list[tuple[str, int]]) -> dict[str, int]:
     """每个人一条：（号码 -> bind_id）。一个人绑着几个号（占位编号和后来认出的 QQ 号）时只留一个：
     官方机器人现在认的那个，没有说法时真正的 QQ 号，再不然最小的那个。否则统计里同一个人会算两次。"""
-    identity = sys.modules.get("plugins.official_bridge.identity")  # 只在配置了官方机器人的地方才有
+    identity = sys.modules.get("plugins.official_bridge.identity")  # 离线测试里没有它
     recognised = getattr(identity, "recognised", None)
 
     def rank(number: str) -> tuple:

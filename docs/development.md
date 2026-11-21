@@ -27,13 +27,13 @@ QQ  <-->  QQ 开放平台  <-- WebSocket / HTTP -->  nonebot-adapter-qq  -->  pl
 桥接层还能替其他 OneBot v11 程序连官方机器人，我用它接 [nonebot-bison](https://github.com/MountainDash/nonebot-bison)，见 `relay.py`。
 桥接层各文件的分工写在 `official_bridge/__init__.py` 开头。
 
-`bot.py` 只在设置了 `QQ_BOTS` 时才注册官方适配器、加载桥接层。不设置时就是一个普通的 OneBot v11 机器人，
-这种用法我不维护，也不测试。
+`bot.py` 注册官方适配器、加载桥接层，同时注册 OneBot v11 适配器：插件和桥接层的机器人都按它写，`relay.py` 也用它。
+所以 `QQ_BOTS` 必须设置。
 
-插件里要分清是不是官方机器人的地方不多：
+插件里和桥接层打交道的地方不多：
 
-- `plugins/quick_buttons.py` 的 `is_official_bot` / `can_show_buttons`：能显示按钮就发按钮，不能就发文字，
-  比如文字菜单、图后的一行「还可以发：…」。按钮菜单和群里文字菜单的撤回也在这里。
+- `plugins/quick_buttons.py`：按钮放不下或被平台拒收时，改发调用方给的文字（`fallback`）。
+  按钮菜单和带 `recall_text` 的文字菜单的撤回也在这里。
 - 少数插件用 `sys.modules` 查找桥接层，从不直接导入它：`skland_bind_sign` 私聊扫码认回绑定，`skland_health` 迁移期间的等待名单，
   以及 `endfield_guide` 收集战绩和配装时，一个人绑着几个号只算一次，记在官方机器人认的那个号下。
 - `plugins/skl_help/help.html` 里用注释标出只在某种情况下出现的内容，见 [修改帮助图](#修改帮助图)。
@@ -54,8 +54,8 @@ deploy/
   restart_when_idle.py         等到没有指令在处理、也没有战绩收集、卫戍榜统计、账号体检或夜间签到在进行时，再重启服务
   restore_health_backup.py     把账号体检删掉的账号、角色和抽卡记录从备份写回数据库（先核对，加 --apply 才写）
 plugins/
-  official_bridge/             QQ 官方机器人桥接层，设置了 QQ_BOTS 时加载；coexist/ 是和 NapCat 账号并存时才用的部分
-  quick_buttons.py             快捷按钮；显示不了按钮时的文字；按钮菜单和群里文字菜单的撤回
+  official_bridge/             QQ 官方机器人桥接层；coexist/ 是和 NapCat 账号并存时才用的部分
+  quick_buttons.py             快捷按钮；按钮发不出时的文字；按钮菜单和带 recall_text 的文字菜单的撤回
   friend_welcome/              加好友时的欢迎语和可点的指令，机器人进群时的设置说明；/抽卡记录 问看哪一款游戏
   ef_theme/                    共用的终末地风格样式和字体
   ark_theme/                   共用的明日方舟风格样式
@@ -64,13 +64,13 @@ plugins/
   endfield_roster/             终末地角色卡（/zmd开盒）
   arknights_roster/            明日方舟角色卡（/mrfz开盒）
   arknights_garrison/          卫戍协议战绩（/卫，数据用上游的 GarrisonView，图自己画）和卫戍榜（每天 10:30 统计，结果在 data/arknights_garrison/board.json）
-  skland_gacha_rank/           欧非榜（全部绑定用户一起排名，统计结果缓存在 data/skland_gacha_rank/snapshot.json）
+  skland_gacha_rank/           两款游戏的欧非榜（全部绑定用户一起排名，统计结果缓存在 data/skland_gacha_rank/ 下的 snapshot.json 和 arknights_snapshot.json）
   heybox_import/               从小黑盒导入早期抽卡记录
   weekly_report/               本周任务（/本周任务，发指令时生成）
   game_calendar/               两款游戏的活动日历和活动开启通知
   skland_health/               账号体检；每晚签到和森空岛请求的超时重试；backup.py 是删除前的备份（backups/skland-health/ 下只追加的 .jsonl）；
                                dormant.py 是迁移期间未认出成员的暂停和 45 天后解绑
-  sanity_reminder/             /理智 查询
+  skland_sanity/               /理智 查询
   skl_help/                    帮助图：help.html 按配置生成图片（render.py）；分类按钮和 /帮助 分类名 的文字版（guide.py）
   skland_ef_theme/             抽卡记录等页面的终末地风格模板，上游图片模板的小修正
   skland_compact_images/       上游插件渲染的图片统一转成 WebP，超长页面适当缩小；同时出图的数量有上限
@@ -88,15 +88,13 @@ plugins/
   sqlite_foreign_keys/         给 SQLite 打开外键约束，解绑时角色和抽卡记录跟着账号一起删
   log_privacy/                 日志不记聊天内容，只留消息编号、发送者和群号
   skland_shortcuts/            指令别名，上游提示语改成这里的指令名；没绑定、没有默认角色时说明接着发什么
-  skland_reaction_order/       上游指令的「完成」表情改到回复发出之后再发
   skland_resource_resilience/  上游资源下载的超时和重试；启动时先读本地数据，资源检查放到启动以后
   command_tolerance/           指令进来前统一写法：去掉开头的文字版「@机器人」、「角色2」换成 -r 2、去掉末尾的空白
-  temp_session_forward/        OneBot 群临时会话和私聊里触发的合并转发只发给本人
-  forward_reply_owner/         群里多页结果的聊天记录卡片标上群名片，卡片后 @ 查询人；官方机器人上只去掉上游的预告
-  group_onboarding/            自动同意 OneBot 的入群邀请；官方机器人进群没有这种邀请，用不到
+  temp_session_forward/        和 NapCat 账号并存时，群临时会话里触发的合并转发只发给本人（随 coexist/ 一起删）
+  forward_reply_owner/         群里不发上游「…过多，将以多张图片形式发送」这类预告
   strict_command.py            指令严格匹配的规则
-  shared.py                    共用的小工具：原子写 JSON、表情回应、取当前的 OneBot 机器人、私聊通知超级用户、
-                               机器人离开群的判断、图片上传超时的判断
+  shared.py                    共用的小工具：原子写 JSON、取当前的 OneBot 机器人、私聊通知超级用户、
+                               机器人离开群的判断、群里没开主动发言的拒收判断
 local_plugins/                 只在本机用的插件：放进来的包会被 bot.py 自动加载，目录不进仓库（可选）
 ```
 
@@ -117,9 +115,7 @@ nonebot-plugin-htmlrender 固定在 0.6.7，不要升级。
 
 | 标记 | 保留的条件 |
 |---|---|
-| `<!--official-->…<!--/official-->` | 设置了 `QQ_BOTS` |
-| `<!--napcat-->…<!--/napcat-->` | 没设置 `QQ_BOTS`，也就是普通的 OneBot v11 机器人 |
-| `<!--migration-->…<!--/migration-->` | 设置了 `QQ_BOTS`，而且 `HELP_MIGRATION_NOTE=true` |
+| `<!--migration-->…<!--/migration-->` | `HELP_MIGRATION_NOTE=true` |
 | `<!--bison-->…<!--/bison-->` | `HELP_BISON=true`。Bison 的指令不属于这个项目，没装 Bison 时不应该出现 |
 
 文中的 `BOT_NAME` 会换成 `.env` 的 `HELP_BOT_NAME`，默认「机器人」。机器人启动时比较这次生成的页面和上次的是否一样，
@@ -147,6 +143,6 @@ nonebot-plugin-htmlrender 固定在 0.6.7，不要升级。
 
 这个仓库不带测试，也没有 CI，没有任何自动检查。
 
-改了代码要自己验证：先在测试群里，用设置了 `QQ_BOTS` 的配置，把改动涉及的指令真的发一遍。
+改了代码要自己验证：先在测试群里把改动涉及的指令真的发一遍。
 
 [返回首页](../README.md)

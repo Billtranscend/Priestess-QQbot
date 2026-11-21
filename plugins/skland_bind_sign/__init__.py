@@ -12,9 +12,9 @@
 用凭据绑定（上游的 `skland bind`，`/sk -b`、`/sk --bind`，以及旧写法 /skltoken绑定）已关闭，而且完全不回应：
 贴到聊天里的凭据等于完整的登录，只能扫码绑定。
 
-官方机器人上，群里发的 /skl绑定 把二维码私聊发给本人，群里只说一句；之后这条指令的回复和抽卡同步的通知
-也都私聊（/skl添加账号 只有二维码私聊：角色列表和「确认」留在群里）。私聊发不出去（还不是好友）就照旧
-发在群里，末尾加一句加好友的提示。
+群里发的 /skl绑定 把二维码私聊发给本人，群里只说一句；之后这条指令的回复和抽卡同步的通知也都私聊
+（/skl添加账号 只有二维码私聊：角色列表和「确认」留在群里）。私聊发不出去（还不是好友）就照旧发在群里，
+末尾加一句加好友的提示。
 
 下面两条规则是因为二维码可能发在群里，森空岛分不出是谁扫的：
   - 一个森空岛账号只能属于一个 QQ；
@@ -27,7 +27,8 @@
     正在拉取、请成员稍等；在各自第一次尝试结束前，两款游戏的抽卡记录指令和更新指令都回答“请稍等”；
   - 两边都结束后，在成员绑定的地方用一条消息告诉他结果。
 
-另外，协议端撤回二维码失败时绑定照常进行（上游在扫码和保存之间撤回那张图片）。
+另外，撤回二维码失败时（平台只让撤约两分钟内的消息，或桥接找不到那条消息）绑定照常进行
+（上游在扫码和保存之间撤回那张图片）。
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ require("plugins.skland_auto_gacha")
 require("plugins.skland_ark_gacha")
 
 import nonebot_plugin_localstore as store
-from nonebot_plugin_alconna import Option, Text, UniMessage, command_manager
+from nonebot_plugin_alconna import Option, UniMessage, command_manager
 from nonebot_plugin_alconna.consts import ALCONNA_RESULT
 from nonebot_plugin_alconna.uniseg.message import current_send_wrapper
 from nonebot_plugin_orm import get_session
@@ -74,14 +75,12 @@ from nonebot_plugin_skland.matcher import skland_command
 from nonebot_plugin_skland.model import SkUser
 from nonebot_plugin_skland.services import binding as binding_service
 from nonebot_plugin_skland.services.sign import sign_character
-from nonebot_plugin_skland.utils.message import send_reaction
 from sqlalchemy import select
 
 from plugins import skland_ark_gacha as ark_gacha
 from plugins import skland_auto_gacha as auto_gacha
 from plugins.skland_roles import owner_id_of
 from plugins import shared
-from plugins.quick_buttons import is_official_bot
 from plugins.shared import first_bot, write_json
 
 __plugin_meta__ = PluginMetadata(
@@ -98,7 +97,6 @@ RENEWED = "\n登录凭证已更新，之前保存的抽卡记录都还在"
 SYNC_NOTICE = "\n正在拉取你的终末地和明日方舟抽卡记录，完成后会在这里通知你；收到通知前请先不要查看或更新抽卡记录"
 SYNC_BUSY = "正在自动拉取你的抽卡记录，完成后我会{where}通知你，请收到通知后再查看"
 HEYBOX_HINT = "\n" + shared.HEYBOX_HINT
-  # 各游戏从小黑盒补回早期记录的指令
 GAMES = {"ef": ("终末地", "/zmd抽卡记录"), "ark": ("明日方舟", "/mrfz抽卡记录")}  # 绑定后排队同步的游戏：名称、查看记录的指令
 SYNCED = {"first": "抽卡记录拉取完成：", "add": "新账号的抽卡记录已同步：", "renew": "抽卡记录已重新同步："}
 PENDING_FILE = store.get_plugin_data_file("pending.json")
@@ -124,8 +122,6 @@ def _install_notice(notice: str) -> None:
             consumed = True
             current_send_wrapper.set(previous)
             message = message.copy()
-            if SYNC_NOTICE in notice:  # 说的是同一件事，比队列自己那一行更准确
-                message = UniMessage(Text(seg.text.replace(auto_gacha.BIND_NOTICE, "")) if isinstance(seg, Text) else seg for seg in message)
             message += notice
         return message
 
@@ -164,7 +160,7 @@ async def _after_binding(owner_id: int, qq: str | None) -> None:
     if qq is None or garrison is None:
         return
     try:
-        # 在空的上下文里运行：/卫戍榜 更新 会给“正在处理的那条消息”加表情回应，不能加到绑定的那条上
+        # 在空的上下文里运行：卫戍榜更新是独立的后台任务，不沿用绑定那条指令的上下文
         said = await asyncio.get_running_loop().create_task(garrison.refresh_one(qq), context=Context())
         logger.info(f"Stronghold board after binding: {'updated' if said.startswith('卫戍榜成绩已更新') else 'nothing to show'}")
     except Exception as e:
@@ -232,13 +228,15 @@ def _forget_chat(owner_id: int) -> None:
         _save_pending(pending)
 
 
-def _rank_opted_out(qq: str) -> bool:
+def _rank_opted_out(qq: str, owner_id: int) -> set[str]:
+    """退出了欧非榜的游戏（GAMES 的键），按号码或按人（o<成员 id>）退出的都算；名单读不了时当作都退出了（不说加入）。"""
     try:
-        from plugins import skland_gacha_rank
+        from plugins import skland_gacha_rank as rank
 
-        return qq in skland_gacha_rank._load_optout()
+        marks = {qq, f"o{owner_id}"}
+        return {game for game, board in (("ef", rank.ENDFIELD), ("ark", rank.ARKNIGHTS)) if marks & rank._load_optout(board)}
     except Exception:
-        return False
+        return set(GAMES)
 
 
 def _expect(owner_id: int, games: list[str]) -> None:
@@ -253,10 +251,10 @@ def _expect(owner_id: int, games: list[str]) -> None:
     _save_pending(pending)
 
 
-def _sync_report(kind: str, results: dict[str, list], ranked: bool = True) -> str | None:
+def _sync_report(kind: str, results: dict[str, list], opted_out: set[str] = frozenset()) -> str | None:
     """绑定后排的抽卡同步都结束了，在成员绑定的地方说的话；None：没什么值得说的。
 
-    results：游戏 -> [状态, 新增条数]；ranked：终末地记录计入欧非榜（成员没有退出）。
+    results：游戏 -> [状态, 新增条数]；opted_out：成员退出了欧非榜的游戏，不说加入了统计名单。
     """
     shown, parts, failed = [], [], []
     for game, (status, records) in results.items():
@@ -271,7 +269,7 @@ def _sync_report(kind: str, results: dict[str, list], ranked: bool = True) -> st
             else:
                 part = f"{name} {records} 条" if kind == "first" else f"{name}新增 {records} 条"
             notes = [f"有角色拉取失败，可稍后发送 {command}更新 重试"] if status == "partial" else []
-            if game == "ef" and kind == "first" and records and ranked:
+            if kind == "first" and records and game not in opted_out:
                 notes.append("现已加入欧非榜统计名单")
             parts.append(part + (f"（{'；'.join(notes)}）" if notes else ""))
     if not shown:
@@ -301,7 +299,7 @@ async def _on_synced(game: str, owner_id: int, status: str, records: int, final:
     if not waiting:
         pending.pop(str(owner_id))
     _save_pending(pending)
-    text = None if waiting else _sync_report(entry.get("kind") or "first", results, ranked=not _rank_opted_out(entry["qq"]))
+    text = None if waiting else _sync_report(entry.get("kind") or "first", results, _rank_opted_out(entry["qq"], owner_id))
     asked = None if waiting else _asked.pop(owner_id, (None, 0.0))[0]
     bot = first_bot()
     if text is None or bot is None:
@@ -454,7 +452,7 @@ QR_ADD_FRIEND = "\n加我为好友后，下次二维码会私聊发给你，别�
 
 
 class PrivateQR:
-    """官方机器人上，一位成员在群里发的 /skl绑定 或 /skl添加账号（一次指令一个）。
+    """一位成员在群里发的 /skl绑定 或 /skl添加账号（一次指令一个）。
 
     phase：waiting 二维码还没发；sending 正私聊发二维码；private 之后的回复都私聊（/skl绑定）；
     group 之后都在群里（/skl添加账号，或私聊发不出去）；over 指令已结束（后台任务也可能还拿着它）。
@@ -549,9 +547,9 @@ if getattr(_upstream_qrcode, "_bind_sign", False):
 
 @functools.wraps(_upstream_qrcode)
 async def _qrcode_privately(user_session, session) -> None:
-    """官方机器人上群里发的指令：二维码私聊发给本人（PrivateQR）；其他情况原样交给上游。"""
+    """群里发的指令：二维码私聊发给本人（PrivateQR）；其他情况原样交给上游。"""
     event = current_event.get(None)
-    if not isinstance(event, GroupMessageEvent) or not is_official_bot():
+    if not isinstance(event, GroupMessageEvent):
         await _upstream_qrcode(user_session, session)
         return
     answer = PrivateQR(event, adding=_add_requested())
@@ -575,7 +573,7 @@ if getattr(_previous_commit, "_bind_sign", False):
 
 @functools.wraps(_previous_commit)
 async def _commit_with_followups(prepared, session):
-    """套在 skland_auto_gacha 的钩子之上：准备同步通知、补充回复、签到和更新卫戍榜。"""
+    """保存绑定之后：两款游戏的抽卡记录排队同步，准备同步通知、补充回复、签到和更新卫戍榜。"""
     kind, owner_id = _flow.get(None), prepared.owner_id
     if kind:
         try:
@@ -583,15 +581,15 @@ async def _commit_with_followups(prepared, session):
         except Exception as e:
             logger.warning(f"Skland binding: sync notice not armed: {type(e).__name__}")
     try:
-        await _previous_commit(prepared, session)  # 提交绑定（并把抽卡同步排进队列）
+        await _previous_commit(prepared, session)
     except BaseException:
         if kind:
             with contextlib.suppress(Exception):
                 _forget_chat(owner_id)  # 没有排同步，所以不会有任何报告
         raise
+    games = [game for game, queue in (("ef", auto_gacha), ("ark", ark_gacha)) if _queue_sync(queue, owner_id)]
     if not kind:
         return
-    games = [game for game, queued in (("ef", auto_gacha.bind_sync_pending(owner_id)), ("ark", _queue_ark(owner_id))) if queued]
     try:
         _expect(owner_id, games)
     except Exception as e:
@@ -605,11 +603,12 @@ async def _commit_with_followups(prepared, session):
         task.add_done_callback(_tasks.discard)
 
 
-def _queue_ark(owner_id: int) -> bool:
+def _queue_sync(queue, owner_id: int) -> bool:
+    """排一次抽卡同步（queue 是 skland_auto_gacha 或 skland_ark_gacha），排上了返回 True。"""
     try:
-        return ark_gacha.queue_after_binding(owner_id)
+        return queue.queue_after_binding(owner_id)
     except Exception as e:  # 绑定已经提交了，绝不能把它误报成绑定失败
-        logger.error(f"Skland binding: Arknights gacha sync not queued: {type(e).__name__}")
+        logger.error(f"Skland binding: gacha sync not queued ({queue.__name__}): {type(e).__name__}")
         return False
 
 
@@ -626,7 +625,7 @@ async def _restore_identity(user_session, session, skland_user_id: str, own_acco
         from nonebot.matcher import current_bot
         from nonebot_plugin_user.models import Bind
 
-        official_bridge = sys.modules.get("plugins.official_bridge")  # 只在配置了官方机器人的地方才有（bot.py）；绝不从这里导入
+        official_bridge = sys.modules.get("plugins.official_bridge")  # 离线测试里没有它；绝不从这里导入
         if official_bridge is None:
             return None
 
@@ -662,8 +661,6 @@ async def _confirm(*, owner_id, pending, snapshot, mode, user_session, session) 
     if taken is not None:
         restored = await _restore_identity(user_session, session, pending.skland_user_id, own_accounts)
         if restored is not None:
-            if restored == RESTORED:
-                send_reaction(user_session, "done")
             await UniMessage(restored).send(at_sender=True)
             return
         logger.info("Skland bind guard: refused, the account belongs to another QQ")
@@ -701,7 +698,6 @@ async def _confirm(*, owner_id, pending, snapshot, mode, user_session, session) 
         await UniMessage(CHANGED).send(at_sender=True)
         return
     else:
-        send_reaction(user_session, "done")
         await UniMessage(BOUND).send(at_sender=True)  # 提交时装上的包装函数会补上后续的几行
     finally:
         _flow.reset(token)
@@ -752,7 +748,7 @@ async def _wait_for_bind_sync(matcher: Matcher, bot: Bot, event: MessageEvent, s
 async def _recall_may_fail(bot: Bot, exception: Exception | None, api: str, data: dict, result) -> None:
     """森空岛指令里撤回失败时，记日志并当作已撤回。
 
-    协议端（如 NapCat）调用 recallMsg 有时会超时。到那时二维码已经扫过或过期了，
+    桥接只认它记下的消息，平台也只让撤约两分钟内的消息，所以撤回可能失败；到那时二维码已经扫过或过期了，
     所以把图片留在聊天里毫无损失，而抛出的异常却会让绑定失败。
     """
     if api != "delete_msg" or exception is None:

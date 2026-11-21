@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import functools
 import hashlib
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -25,8 +24,6 @@ require("nonebot_plugin_apscheduler")
 require("nonebot_plugin_orm")
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_orm import get_session
-from nonebot_plugin_alconna import UniMessage
-from nonebot_plugin_alconna.uniseg.message import current_send_wrapper
 from nonebot_plugin_skland.api import SklandAPI, SklandLoginAPI
 from nonebot_plugin_skland.model import SkUser, Character, GachaRecord
 from nonebot_plugin_skland.schemas import EndfieldPoolType
@@ -93,31 +90,11 @@ _queue: Queue | None = None
 _busy = asyncio.Lock()
 _active: asyncio.Task | None = None
 _stopping = False
-BIND_NOTICE = "\n终末地抽卡记录已加入自动更新队列，稍后可使用 /zmd抽卡记录 查看"
 
-
-def install_binding_notice():
-    """一次性，只作用于当前 matcher 的上下文；保留已有的发送扩展。"""
-    previous = current_send_wrapper.get(None)
-    consumed = False
-
-    async def with_notice(bot, event, message):
-        nonlocal consumed
-        if (not consumed and isinstance(message, UniMessage)
-                and message.extract_plain_text() in {"绑定成功", "账号更新成功"}):
-            consumed = True
-            current_send_wrapper.set(previous)
-            message = message.copy()
-            message += BIND_NOTICE
-        if previous is not None:
-            return await previous(bot, event, message)
-        return message
-
-    current_send_wrapper.set(with_notice)
 
 # 编写本插件时所依据的上游源码。
 _HASHES = {
-    "services/binding.py": "846e7b85cc5aa66105542a8fe87934762db6fb2a5991f48a2f08109684c7cea8",
+    "services/binding.py": "846e7b85cc5aa66105542a8fe87934762db6fb2a5991f48a2f08109684c7cea8",  # skland_bind_sign 替换其中的 commit_account_binding
     "services/gacha.py": "cb6ddcc782860b3a1d170adb9f2f17cfc082964d3c8997925b7b34918b441fce",
     "model.py": "94ec29e96e1855101b15cff39b0cd0f1ebd1cc7b8b2b0259e29b7a19ff50c370",
     "api/login.py": "fd35e3557de88bdb932ae71d9f37925489016e3535d2d273563bd798f0a12dc3",
@@ -135,31 +112,6 @@ def verify_upstream():
 
 
 verify_upstream()
-_original_commit = binding.commit_account_binding
-if getattr(_original_commit, "_auto_gacha", False):
-    raise RuntimeError("Skland auto-gacha binding hook already installed")
-
-
-@functools.wraps(_original_commit)
-async def _commit_then_enqueue(prepared, session):
-    """每次保存绑定（第一个账号、另一个账号、重新登录）都为其所有者排一次同步。"""
-    await _original_commit(prepared, session)  # 先提交账号及其角色。
-    if _queue is None:
-        raise RuntimeError("Skland auto-gacha queue not initialized")
-    try:
-        _queue.enqueue(prepared.owner_id)
-    except Exception as exc:
-        # 绑定已经提交了；绝不能把它误报成绑定失败。
-        logger.error("auto-efgacha enqueue_failed error_type={}", type(exc).__name__)
-    else:
-        install_binding_notice()
-        logger.info("auto-efgacha binding_committed queued=1")
-
-
-_commit_then_enqueue._auto_gacha = True
-binding.commit_account_binding = _commit_then_enqueue
-
-
 async def sync_user(owner_id: int) -> tuple[str, int]:
     """同步成员的每个终末地角色：返回（"success" | "partial" | 原因，新增行数）。
 
@@ -254,6 +206,14 @@ async def sync_user(owner_id: int) -> tuple[str, int]:
 # 其他本地插件可以在排队的同步结束时收到通知：
 #   await listener(user_id, status, new_records, final)   （final=False：已安排重试）
 sync_listeners: list = []
+
+
+def queue_after_binding(owner_id: int) -> bool:
+    """绑定（第一个账号、另一个账号、重新登录）之后立刻排一次同步（skland_bind_sign 调用）。排上了返回 True。"""
+    if _queue is None or _stopping:
+        return False
+    _queue.enqueue(owner_id)
+    return True
 
 
 def bind_sync_pending(user_id: int) -> bool:
@@ -368,11 +328,6 @@ async def drain_queue():
 async def start_auto_gacha():
     global _queue, _stopping
     verify_upstream()
-    hook = binding.commit_account_binding
-    while hook is not _commit_then_enqueue and getattr(hook, "_bind_sign", False):  # skland_bind_sign 会包住这个钩子
-        hook = hook.__wrapped__
-    if hook is not _commit_then_enqueue:
-        raise RuntimeError("Skland auto-gacha binding hook replaced")
     _queue = Queue(STATE)
     _queue.initialize_day(datetime.now(timezone.utc))
     _stopping = False

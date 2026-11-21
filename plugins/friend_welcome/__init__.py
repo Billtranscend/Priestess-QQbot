@@ -1,18 +1,15 @@
 """有人刚加机器人好友时的欢迎语、机器人被加进群时说的话，以及欢迎语里推荐的抽卡记录指令。
 
-在能在私聊消息下方放可点击指令的机器人上（官方机器人，见 plugins/quick_buttons.py），
-加好友的人会收到一条消息：一行欢迎语，下面是 SUGGESTED 里的指令。推荐指令点下去发送的就是
-显示的文字，而抽卡记录分成两个指令，每款游戏一个；所以这里单独给它一个指令 /抽卡记录，
-由它询问要看哪款游戏。
+加好友的人会收到一条消息：一行欢迎语，下面是 SUGGESTED 里可点击的推荐指令
+（见 plugins/quick_buttons.py）。推荐指令点下去发送的就是显示的文字，而抽卡记录分成两个指令，
+每款游戏一个；所以这里单独给它一个指令 /抽卡记录，由它询问要看哪款游戏。
 
-同一个机器人被加进群时，会说一次自己能做什么，以及群主可以打开哪两项设置让功能完整
+机器人被加进群时，会说一次自己能做什么，以及群主可以打开哪两项设置让功能完整
 （GROUP_WELCOME）：大多数群主根本不知道有这两项设置，不打开的话机器人收不到消息 @ 了谁，
 也发不了提醒。这段话作为对“被加进群”事件的回复发出——群里允许这样回复，即使还没允许机器人
 主动发言；之后不再重复，也不会发到机器人已经在的群。
 
-其他机器人上不发欢迎语：那里机器人不主动说话，打招呼的处理也就只在官方机器人上、只为这两种通知运行
-（NapCat 上每条通知都会过一遍这里）。/抽卡记录 在所有机器人上都会回答，
-不能显示按钮的地方用文字列出两个指令。
+打招呼的处理只为这两种通知运行。/抽卡记录 按钮发不出时用文字列出两个指令。
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ from nonebot.adapters.onebot.v11.event import FriendAddNoticeEvent, GroupIncreas
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import Rule
 
-from plugins.quick_buttons import can_show_buttons, send_buttons, send_hints
+from plugins.quick_buttons import send_buttons, send_hints
 from plugins.strict_command import strict
 
 __plugin_meta__ = PluginMetadata(
@@ -51,10 +48,8 @@ GROUP_WELCOME = (
 GROUP_SUGGESTED = [("查看帮助", "/帮助"), ("绑定账号", "/skl绑定")]
 
 
-def _greeting_due(bot: Bot, event: Event) -> bool:
-    """官方机器人上，有人加了好友，或者机器人自己被加进群。"""
-    if not can_show_buttons(bot):
-        return False
+def _greeting_due(event: Event) -> bool:
+    """有人加了好友，或者机器人自己被加进群。"""
     return isinstance(event, FriendAddNoticeEvent) or (isinstance(event, GroupIncreaseNoticeEvent) and event.user_id == event.self_id)
 
 

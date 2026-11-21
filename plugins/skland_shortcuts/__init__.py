@@ -36,7 +36,6 @@ from nonebot_plugin_skland.commands.endfield.sign import ef_sign_status_handler
 from nonebot_plugin_skland.config import CACHE_DIR
 from nonebot_plugin_skland.db_handler import get_accounts, get_default_character, get_user_characters
 from nonebot_plugin_skland.matcher import skland, skland_command
-from nonebot_plugin_skland.utils.message import send_reaction
 
 from plugins.shared import private_answer
 from plugins.skland_roles import owner_id_of
@@ -44,7 +43,7 @@ from plugins.skland_roles import owner_id_of
 __plugin_meta__ = PluginMetadata(
     name="Skland project shortcuts",
     description="注册并保存本项目的森空岛中文快捷指令，重复执行也不会重复注册。",
-    usage="无指令，自动生效。",
+    usage="快捷指令自动注册；另有 /签到详情（两个游戏的签到状态）和超级用户的 /全体签到、/全体签到详情。",
     type="application",
 )
 
@@ -156,8 +155,6 @@ RESCAN = "森空岛登录已失效，请发送 /skl绑定 重新扫码"
 
 # 上游的提示里写的是原始选项参数，用快捷指令的人从来不打这些；改成说快捷指令。
 HINT_REWRITES = {
-    "临时选角: 查询、签到、状态及抽卡导入命令可追加 -r <序号>": "临时查看别的角色：在指令后面加 角色序号，例如 /zmd开盒 角色2（不改默认角色）",
-    "切换默认角色: sk char set ark <序号> / sk char set ef <序号>": "切换默认角色：/skl切换方舟角色 序号、/skl切换终末地角色 序号",
     "请执行 sk char set ark <序号>": "请发送 /skl切换方舟角色 序号",
     "请执行 sk char set ef <序号>": "请发送 /skl切换终末地角色 序号",
     "请以最新 sk char 卡片为准": "请以 /skl角色 的最新卡片为准",
@@ -205,18 +202,17 @@ PATTERN_REWRITES = (
 )
 
 
-# 上游放在角色列表下面、教人输入角色序号的两行。机器人在列表后面跟着按钮时（plugins/skland_buttons）
-# 就去掉这两行：那里点一下就能切换，而 角色序号 的写法在帮助图片里有。
+# 上游放在角色列表下面、教人输入角色序号的两行，一律去掉：有别的角色可切换时，列表后面跟着
+# 切换按钮（plugins/skland_buttons），而 角色序号 的写法在帮助图片里有。
 ROLE_LIST_LINES = (
     "临时选角: 查询、签到、状态及抽卡导入命令可追加 -r <序号>",
     "切换默认角色: sk char set ark <序号> / sk char set ef <序号>",
 )
 
 
-def _rewrite(text: str, taps: bool = False) -> str:
-    if taps:
-        for line in ROLE_LIST_LINES:
-            text = text.replace("\n" + line, "").replace(line, "")
+def _rewrite(text: str) -> str:
+    for line in ROLE_LIST_LINES:
+        text = text.replace("\n" + line, "").replace(line, "")
     for hint, replacement in HINT_REWRITES.items():
         text = text.replace(hint, replacement)
     for pattern, replacement in PATTERN_REWRITES:
@@ -225,8 +221,8 @@ def _rewrite(text: str, taps: bool = False) -> str:
 
 
 NOT_BOUND = ("你还没有绑定森空岛账号", "未绑定森空岛账号，请先发送 /skl绑定")  # 上游各指令和理智指令的说法
-BIND_FIRST = "你还没有绑定森空岛账号，请先发送 /skl绑定 扫码绑定"  # 没有按钮时代替上游那句：说出下一步发什么
-# 回复里叫成员接着发的、不用再写任何内容的指令：能挂按钮时，消息下面给它们各一个按钮
+BIND_FIRST = "你还没有绑定森空岛账号，请先发送 /skl绑定 扫码绑定"  # 按钮发不出时代替上游那句：说出下一步发什么
+# 回复里叫成员接着发的、不用再写任何内容的指令：消息下面给它们各一个按钮
 NEXT_STEPS = ("/skl绑定", "/skl添加账号", "/skl角色更新", "/zmd抽卡记录更新", "/mrfz抽卡记录更新")
 _NEXT_STEP = re.compile("(" + "|".join(re.escape(c) for c in sorted(NEXT_STEPS, key=len, reverse=True)) + r")(?![\w-])")
 
@@ -277,9 +273,8 @@ async def _rewrite_upstream_hints(bot, api: str, data: dict[str, Any]) -> None:
     if api not in ("send_msg", "send_group_msg", "send_private_msg"):
         return
     message = data.get("message")
-    taps = can_show_buttons(bot)
     if isinstance(message, str):
-        data["message"] = BIND_FIRST if message.strip() == NOT_BOUND[0] else _rewrite(message, taps)
+        data["message"] = BIND_FIRST if message.strip() == NOT_BOUND[0] else _rewrite(message)
         return
     segments = [message] if hasattr(message, "type") and hasattr(message, "data") else message or ()  # 单独一个 MessageSegment 不能迭代
     emptied = []
@@ -289,18 +284,18 @@ async def _rewrite_upstream_hints(bot, api: str, data: dict[str, Any]) -> None:
             words = await no_default_words(missing.group(1), getattr(current_event.get(None), "user_id", None))
             text = segment.data["text"] = NO_DEFAULT.sub(lambda _: words, text)
         if text:
-            segment.data["text"] = _rewrite(text, taps)
-            if taps and text.strip() and not segment.data["text"].strip():
+            segment.data["text"] = _rewrite(text)
+            if text.strip() and not segment.data["text"].strip():
                 emptied.append(segment)  # 除了被去掉的那几行什么都没有：图片单独发
     for segment in emptied:
         if isinstance(message, list):
             message.remove(segment)
-    # 叫成员接着发某条指令的纯文字回复（没绑定、要更新角色、要拉取抽卡记录……）：能挂按钮时同一句话
-    # 下面带这些指令的按钮；发不出按钮就照原样发，只有没绑定的那句换成写出指令的 BIND_FIRST。
+    # 叫成员接着发某条指令的纯文字回复（没绑定、要更新角色、要拉取抽卡记录……）：同一句话下面带
+    # 这些指令的按钮；按钮发不出就照原样发，只有没绑定的那句换成写出指令的 BIND_FIRST。
     words = "".join(s.data.get("text", "") for s in segments if s.type == "text")
     asker = getattr(current_event.get(None), "user_id", None)
     only_words = all(s.type == "text" or (s.type == "at" and str(s.data.get("qq")) == str(asker)) for s in segments)  # 只 @ 了提问的人
-    steps = (["/skl绑定"] if words.strip() in NOT_BOUND else next_steps(words)) if taps and only_words else []
+    steps = (["/skl绑定"] if words.strip() in NOT_BOUND else next_steps(words)) if only_words else []
     if steps:
         asker = asker if data.get("group_id") else None  # 群里由桥接 @ 他（真正的 @）
         text = "你还没有绑定森空岛账号\n点击下面的按钮进行扫码绑定" if words.strip() in NOT_BOUND else plain(words.strip())
@@ -335,7 +330,7 @@ switch_usage = on_message(rule=_switch_without_number, priority=0, block=True)
 async def _(bot: AnyBot, event: Event) -> None:
     match = SWITCH.match(event.get_plaintext())
     game = "方舟" if match and match.group(1).lower() in ("明日方舟", "方舟", "mrfz") else "终末地"
-    # 成员在该游戏有别的角色可切换时，列出这些角色（能显示按钮时是按钮，否则每个角色一行文字，
+    # 成员在该游戏有别的角色可切换时，列出这些角色（按钮，按钮发不出时每个角色一行文字，
     # plugins/skland_buttons，加载了才有），而不是回答用法。
     app_code = "arknights" if game == "方舟" else "endfield"
     buttons = sys.modules.get("plugins.skland_buttons")
@@ -505,7 +500,7 @@ async def _configure_shortcuts() -> None:
 
 # ── /全体签到、/全体签到详情：一条指令签到或查看两个游戏所有已绑定的角色 ──
 
-from plugins.quick_buttons import can_show_buttons, plain  # noqa: E402
+from plugins.quick_buttons import plain  # noqa: E402
 from plugins.strict_command import strict  # noqa: E402
 
 sign_all = on_command("全体签到", rule=strict, permission=SUPERUSER, priority=5, block=True)
@@ -519,7 +514,6 @@ async def _(bot: OneBotV11Bot, user_session: UserSession, session: async_scoped_
     等重新绑定的成员不签），签完回复两份签到结果。"""
     from plugins import skland_health  # 在本插件之后加载
 
-    send_reaction(user_session, "processing")
     await asyncio.gather(skland_health.run_daily_sign("arknights"), skland_health.run_daily_sign("endfield"))
     await arksign_status_handler(user_session, session, bot, True, is_superuser=True)
     await ef_sign_status_handler(user_session, session, bot, True, is_superuser=True)

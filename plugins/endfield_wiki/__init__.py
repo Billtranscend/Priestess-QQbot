@@ -40,7 +40,7 @@ from plugins import ef_theme
 
 from . import changes, data, render
 from .lookup import Resolver
-from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, first_bot, tell_superusers, write_json, react as _react
+from plugins.shared import first_bot, tell_superusers, unprompted_refused, write_json
 
 __plugin_meta__ = PluginMetadata(
     name="Endfield wiki",
@@ -190,7 +190,6 @@ async def _(state: T_State) -> None:
         rec = "、".join(index["weapons"][w]["name"] for w in op["recommended"] if w in index["weapons"])
         await lookup.finish(f"{op['name']} 没有专属武器" + (f"，推荐武器：{rec}" if rec else ""))
 
-    await _react(REACTION_PROCESSING)
     try:
         render.RICH_CSS = await rich_css(index)
         if result.kind == "weapon":
@@ -230,9 +229,7 @@ async def _(state: T_State) -> None:
         raise
     except Exception as e:
         logger.warning(f"Endfield wiki render failed: {type(e).__name__}")
-        await _react(REACTION_FAIL)
         await lookup.finish("资料图生成失败，请稍后再试")
-    await _react(REACTION_DONE)
 
 
 # ── 数据同步和更新通知 ─────────────────────────────────────────────────
@@ -265,16 +262,13 @@ async def _notify_all_groups(version: dict, previous: str, new_names: dict[str, 
             await (first_bot() or bot).send_group_msg(group_id=group["group_id"], message=message)  # 发送期间连接可能已经重建
             sent += 1
         except Exception as e:
-            if getattr(e, "retcode", None) == UNPROMPTED_REFUSED:
+            if unprompted_refused(e):
                 refused += 1
                 continue  # 被拒的群什么也没收到，不用为它等发送间隔
             logger.warning(f"Endfield wiki notice failed for one group: {type(e).__name__}")
         await asyncio.sleep(NOTIFY_GAP)
     logger.info(f"Endfield wiki update notice sent to {sent} of {len(groups)} groups ({refused} do not take pushes)")
     return bool(sent or refused) or not groups
-
-
-UNPROMPTED_REFUSED = 40_034_105  # 平台：群里没开“机器人主动在群聊内发言”
 
 
 async def _deliver_pending() -> None:

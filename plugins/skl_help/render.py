@@ -2,10 +2,7 @@
 
 help.html 用注释把只适用于部分部署的内容括起来：
 
-    <!--official-->...<!--/official-->    只在有官方机器人时（设置了 QQ_BOTS）
-    <!--napcat-->...<!--/napcat-->        只在没有官方机器人时
-    <!--migration-->...<!--/migration--> 只在群友从 NapCat 账号迁移过来期间
-                                          （HELP_MIGRATION_NOTE=true；它位于 official 部分之内）
+    <!--migration-->...<!--/migration--> 只在群友从 NapCat 账号迁移过来期间（HELP_MIGRATION_NOTE=true）
     <!--bison-->...<!--/bison-->          只在机器人旁边运行着 nonebot-bison 时（HELP_BISON=true）：
                                           它的订阅指令不属于本项目
 
@@ -44,19 +41,18 @@ def _flag(value: Any) -> bool:
 def settings(config: Any) -> dict[str, Any]:
     """决定页面内容的设置，从 NoneBot 配置（.env）读取。"""
     return {
-        "official": bool(getattr(config, "qq_bots", None)),
         "migration": _flag(getattr(config, "help_migration_note", False)),
         "bison": _flag(getattr(config, "help_bison", False)),
         "name": str(getattr(config, "help_bot_name", "") or "").strip() or DEFAULT_NAME,
     }
 
 
-def page(*, official: bool, migration: bool, name: str, bison: bool = False) -> str:
+def page(*, migration: bool, name: str, bison: bool = False) -> str:
     """只保留本部署适用部分的 help.html，并填入机器人名字和主题字体。"""
     from plugins import ef_theme
 
     html = SOURCE.read_text("utf-8")
-    shown = {"official": official, "napcat": not official, "migration": official and migration, "bison": bison}
+    shown = {"migration": migration, "bison": bison}
     for kind, keep in shown.items():
         html = re.sub(rf"<!--{kind}-->(.*?)<!--/{kind}-->", r"\1" if keep else "", html, flags=re.S)
     # 字体 URL 是本检出目录下的 file:// 路径，所以在这里填入，而不是写死在文件里

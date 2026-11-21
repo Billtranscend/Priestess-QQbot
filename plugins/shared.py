@@ -1,11 +1,10 @@
 """几个插件共用的小工具（普通模块，不是插件）。
 
 - write_json：原子地写 JSON 文件；
-- react 和三个表情码：指令处理中给消息加表情回应；
 - first_bot：定时任务里取一个可用的 OneBot V11 机器人；
 - tell_superusers：私聊告诉每个超级用户一件事；
 - bot_left_group：通知是“机器人自己不在这个群了”（被移出，或群已解散），各插件据此清掉该群的数据；
-- upload_timed_out 和 SLOW_UPLOAD：发图失败其实只是 NapCat 上传慢，回这句话而不是“生成失败”；
+- unprompted_refused：主动发到群里的消息被拒，因为这个群没开「机器人主动在群聊内发言」；
 - heybox_hint：抽卡记录页面上提醒成员可以从小黑盒补全更早的记录；
 - private_answer：群里的一条指令正把回复私聊发给本人（plugins/skland_bind_sign 设，skland_shortcuts 的发送钩子照着改发送对象）。
 """
@@ -29,30 +28,15 @@ def bot_left_group(event: Event) -> bool:
     return getattr(event, "notice_type", None) == "group_decrease" and str(getattr(event, "user_id", "")) == str(getattr(event, "self_id", None))
 
 
-# 和森空岛插件用同一组 QQ 表情
-REACTION_PROCESSING = "66"  # 爱心：正在处理
-REACTION_DONE = "144"  # 彩带：完成
-REACTION_FAIL = "10060"  # 叉号：失败
+UNPROMPTED_REFUSED = 40_034_105  # 官方平台：群里没开「机器人主动在群聊内发言」，重试也一样
 
 
-SLOW_UPLOAD = "图片上传较慢，可能会晚一点出现；如果一直没有出现，请过几分钟再发一次"
+def unprompted_refused(e: Exception) -> bool:
+    """主动发到群里的消息被拒，因为这个群没开「机器人主动在群聊内发言」：那个群什么也没收到。
 
-
-def upload_timed_out(e: Exception) -> bool:
-    """发送失败是 NapCat 等 QQ 收图超时：图往往稍后仍会送达，说“生成失败”会让成员重发、收到两份。
-
-    认 NapCat 回的 ActionFailed（retcode 1200 或提到 timeout），以及 NoneBot 自己等 NapCat 回应超时的
-    NetworkError。官方机器人一律不算：桥接用 1200 表示别的失败（机器人不在群、消息为空、文件读不到等）。
+    桥接回的是 OneBot 的 ActionFailed，错误码在 info 里（它没有 retcode 属性）。
     """
-    from nonebot.adapters.onebot.v11.exception import ActionFailed, NetworkError
-
-    from plugins.quick_buttons import is_official_bot
-
-    if is_official_bot():
-        return False
-    if isinstance(e, ActionFailed):
-        return e.info.get("retcode") == 1200 or "timeout" in str(e).lower()
-    return isinstance(e, NetworkError) and "timeout" in str(e.msg or "").lower()
+    return (getattr(e, "info", None) or {}).get("retcode") == UNPROMPTED_REFUSED
 
 
 def write_json(path: Path, value: Any, **options: Any) -> None:
@@ -67,16 +51,8 @@ def write_json(path: Path, value: Any, **options: Any) -> None:
     tmp.replace(path)
 
 
-async def react(emoji: str) -> None:
-    """给正在处理的那条消息加一个表情回应；做不到（例如官方机器人不支持）就算了。"""
-    from nonebot_plugin_alconna import message_reaction
-
-    with contextlib.suppress(Exception):
-        await message_reaction(emoji)
-
-
 def first_bot():
-    """当前连着的第一个 OneBot V11 机器人（官方机器人经桥接也算），没有时为 None。"""
+    """当前连着的第一个 OneBot V11 机器人（就是桥接的官方机器人），没有时为 None。"""
     from nonebot import get_bots
     from nonebot.adapters.onebot.v11 import Bot
 

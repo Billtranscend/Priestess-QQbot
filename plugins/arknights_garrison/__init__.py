@@ -6,7 +6,7 @@
 资源表约 500 KB，在内存里缓存一天，战绩每次查询时现取。
 
 /卫 的选项用中文：全部（全部记录）、收藏（收藏的对局）、详情 [第几局]（不带数字时列出各局供点选）。
-能挂按钮的机器人上，查自己时下面跟着这些选项的按钮；显示不了按钮的机器人上写成一行文字，全部记录放进一张聊天记录卡片。
+查自己时下面跟着这些选项的按钮。
 
 /卫戍榜 不分群（与 /zmd欧非榜 相同）：每天 10:30（官方每天 10:00 刷新之后，避开夜间签到）
 用每个成员自己的森空岛登录读取他每个明日方舟角色的战绩，奖杯最多的角色上榜（/卫 仍查默认角色），
@@ -43,7 +43,7 @@ from nonebot.typing import T_State
 from pydantic import ValidationError
 
 from plugins import ef_theme
-from plugins.quick_buttons import Rows, can_show_buttons, is_official_bot, rows_fit, rows_of, send_buttons
+from plugins.quick_buttons import Rows, rows_fit, rows_of, send_buttons
 from plugins.strict_command import command_ends_cleanly, strict
 
 require("nonebot_plugin_skland")
@@ -55,7 +55,7 @@ require("nonebot_plugin_apscheduler")
 require("plugins.arknights_roster")
 
 import nonebot_plugin_localstore as store
-from nonebot_plugin_alconna import CustomNode, UniMessage
+from nonebot_plugin_alconna import UniMessage
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_orm import async_scoped_session, get_session
 from nonebot_plugin_skland.api import SklandAPI
@@ -70,7 +70,7 @@ from nonebot_plugin_user import UserSession, get_user
 from sqlalchemy import select
 
 from plugins.arknights_roster import fill_avatars, _avatar
-from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, SLOW_UPLOAD, react as _react, upload_timed_out, write_json
+from plugins.shared import write_json
 from plugins.skland_roles import member_numbers
 
 from . import render
@@ -93,8 +93,6 @@ COLLECT_PAUSE = 1.0  # 同一个 worker 两次读取之间的秒数
 DETAIL = re.compile(r"^(?:详情|第)\s*(\d+)?\s*局?$")
 PAGE = re.compile(r"^第\s*(\d+)\s*页$")
 USAGE = "用法：/卫 [@用户]，后面可加 全部（翻页：第2页）、收藏、第几局（如 /卫 3），看别的角色加 角色序号（如 /卫 角色2）"
-FORWARD_PAGES = 16  # 一张聊天记录卡片最多放几页（与上游的卫戍战绩相同）
-SEVERAL_PICTURES = "卫戍协议对局记录过多，将以多张图片形式发送"  # plugins.forward_reply_owner 认得这句：吞掉它，卡片标上群名片，卡片后 @ 本人
 
 driver = get_driver()
 
@@ -309,7 +307,7 @@ def _page_buttons(number: int, total: int, *, favored: bool, role: str = "") -> 
 def _detail_menu(view: GarrisonView, page: int, *, favored: bool, role: str = "") -> tuple[str, Rows, str]:
     """「单局详情」的下一级：和全部记录同样分页。按钮是每局的编号和策略，最后一行翻页；
     叠了层的盟约放不进按钮，写在上方的文字里，一局一行（行首不能是 #，QQ 会当成标题）。
-    返回 (文字, 按钮, 显示不了按钮时的文字菜单：同样的各局，不用 markdown，末尾写明怎么选、怎么翻页)；
+    返回 (文字, 按钮, 按钮发不出时的文字菜单：同样的各局，不用 markdown，末尾写明怎么选、怎么翻页)；
     没有对局时按钮为空，文字是一句说明。"""
     size = render.PAGE_RECORDS
     total = max(1, -(-len(view.records) // size))
@@ -335,36 +333,22 @@ def _detail_menu(view: GarrisonView, page: int, *, favored: bool, role: str = ""
 
 def _next_steps(view: GarrisonView, *, favored: bool, role: str, show_all: bool, page: int | None = None, total: int = 1) -> tuple[str, Rows]:
     """查自己时图后的下一步：(标题, 按钮)。概览后是全部 / 收藏 / 单局详情；全部记录的一页（page）后是其他各页、
-    这一页的单局详情、返回概览；全部记录一次发完（显示不了按钮的机器人）后是单局详情、返回概览。"""
+    这一页的单局详情、返回概览。"""
     if not show_all:
         return "还可以查看", rows_fit(_buttons(view, favored=favored, role=role))
     prefix = f"/卫{role}" + (" 收藏" if favored else "")
     back = rows_fit([("单局详情", f"{prefix} 详情" + (f" 第{page}页" if page else "")), ("返回概览", prefix)])
-    if page is None:
-        return "还可以查看", back
     return f"第 {page}/{total} 页", _page_buttons(page, total, favored=favored, role=role) + back
 
 
-async def _send_pictures(bot: Bot, view: GarrisonView, images: list[bytes], about_other: bool) -> None:
-    """查自己时第一张图 @ 本人，查别人时引用指令。显示不了按钮的机器人上，多页的全部记录放进聊天记录卡片
-    （每张最多 FORWARD_PAGES 页），不在群里连刷大图；查别人时不发预告：forward_reply_owner 会把卡片标成提问人的记录，
-    页名就保留游戏内的名字。"""
-    if len(images) > 1 and not is_official_bot(bot):
-        if not about_other:
-            await UniMessage.text(SEVERAL_PICTURES).send(reply_to=True)
-        name = view.nickname or render.NAMELESS
-        for start in range(0, len(images), FORWARD_PAGES):
-            await UniMessage.reference(*(
-                CustomNode(bot.self_id, f"{name} | 第 {n}/{len(images)} 页", UniMessage.image(raw=image))
-                for n, image in enumerate(images[start : start + FORWARD_PAGES], start + 1)
-            )).send()
-        return
+async def _send_pictures(images: list[bytes], about_other: bool) -> None:
+    """查自己时第一张图 @ 本人，查别人时引用指令。"""
     for index, image in enumerate(images):
         await UniMessage.image(raw=image).send(at_sender=index == 0 and not about_other, reply_to=index == 0 and about_other)
 
 
 @garrison.handle()
-async def answer(bot: Bot, event: MessageEvent, user_session: UserSession, session: async_scoped_session, arg: Message = CommandArg()) -> None:
+async def answer(event: MessageEvent, user_session: UserSession, session: async_scoped_session, arg: Message = CommandArg()) -> None:
     """回复一次 /卫。"""
     at = next((seg.data.get("qq") for seg in event.message if seg.type == "at" and seg.data.get("qq") != "all"), None)
     about_other = bool(at) and str(at) != event.get_user_id()
@@ -384,20 +368,16 @@ async def answer(bot: Bot, event: MessageEvent, user_session: UserSession, sessi
     page_number = options.pop("page", None)
     favored = options.get("favored", False)
 
-    await _react(REACTION_PROCESSING)
     try:
         view = await view_of(user, character, **options)
         await session.commit()  # 途中刷新的 token
         if not view.records and not sum(m.total for m in view.modes):
-            await _react(REACTION_DONE)
             await garrison.finish(("对方" if about_other else "") + f"还没有{season_title()}的记录", at_sender=not about_other)
         if menu:
             text, rows, words = _detail_menu(view, page_number or 1, favored=favored, role=role)
-            if not rows:  # 没有可选的对局：只是一句回答，不是菜单（NapCat 群里不撤回）
-                await _react(REACTION_DONE)
+            if not rows:  # 没有可选的对局：只是一句回答，不是菜单
                 await garrison.finish(text)
             await send_buttons(text, rows, fallback=words)
-            await _react(REACTION_DONE)
             return
         await fill_avatars({o.char_id for r in view.records for o in r.operators})
         avatars = {o.char_id: _avatar(o.char_id) for r in view.records for o in r.operators}
@@ -408,39 +388,32 @@ async def answer(bot: Bot, event: MessageEvent, user_session: UserSession, sessi
             size = render.PAGE_RECORDS
             chunks = [view.records[i : i + size] for i in range(0, len(view.records), size)] or [[]]
             total = len(chunks)
-            # 能挂按钮时一次一页（查自己时下面有翻页按钮）；指定了第几页也只发那一页；否则全部发出（见 _send_pictures）
-            paged = page_number is not None or (can_show_buttons() and not about_other)
+            # 查自己时一次一页（下面有翻页按钮）；指定了第几页也只发那一页；看别人的全部发出
+            paged = page_number is not None or not about_other
             shown = min(max(page_number or 1, 1), total) if paged else None
             numbered = [(shown, chunks[shown - 1])] if shown else list(enumerate(chunks, 1))
             pages = [render.records_page(view, chunk, avatars, page=n, page_total=total) for n, chunk in numbered]
         else:
-            pages = [render.summary(view, avatars, page_total=1)]
+            pages = [render.summary(view, avatars)]
         images = [await ef_theme.render_page(page, render.WIDTH, scale=render.SCALE, quality=render.QUALITY) for page in pages]
         logger.info(f"Arknights stronghold: {len(images)} pictures, {sum(len(i) for i in images) // 1024} KB")
-        await _send_pictures(bot, view, images, about_other)
-        if not about_other and not view.is_detail:  # 看别人的、单局详情不给下一步（和官方机器人不挂按钮一致）
+        await _send_pictures(images, about_other)
+        if not about_other and not view.is_detail:  # 看别人的、单局详情不给下一步
             title, rows = _next_steps(view, favored=favored, role=role, show_all=show_all, page=shown, total=total)
-            await send_buttons(title, rows, fallback=True)
+            # 无文字兜底：图后附带的下一步，按钮发不出就算了
+            await send_buttons(title, rows)
     except MatcherException:
         raise
     except NotPlayed:
-        await _react(REACTION_DONE)
         await garrison.finish(f"这个角色还没有{season_title()}的对局记录")
     except SklandException as e:
         logger.warning(f"Arknights stronghold: query failed ({type(e).__name__})")
-        await _react(REACTION_FAIL)
         await garrison.finish("卫戍协议战绩获取失败，请稍后再试；如果一直失败，可能需要重新绑定森空岛")
     except ValueError as e:  # GarrisonView：没有这一局等
-        await _react(REACTION_FAIL)
         await garrison.finish(str(e))
     except Exception as e:
-        if upload_timed_out(e):  # 图已经做好，只是上传太久
-            logger.warning("Arknights stronghold: picture upload timed out")
-            await garrison.finish(SLOW_UPLOAD)
         logger.opt(exception=e).warning(f"Arknights stronghold card failed: {type(e).__name__}")
-        await _react(REACTION_FAIL)
         await garrison.finish("卫戍协议战绩生成失败，请稍后再试")
-    await _react(REACTION_DONE)
 
 
 # ---------------------------------------------------------------- /卫戍榜
@@ -674,7 +647,6 @@ async def _refresh_one(qq: str) -> str:
     except asyncio.TimeoutError:
         _refreshed.pop(qq, None)
         return busy
-    await _react(REACTION_PROCESSING)
     try:
         try:
             best, missed = await best_of(*entry)
@@ -683,7 +655,6 @@ async def _refresh_one(qq: str) -> str:
         if best is None and missed:  # 什么也没读到：一分钟后可以再试（不是马上，免得一直失败的人不停地请求）
             _refreshed.pop(qq, None)
             _retry_at[qq] = time.monotonic() + RETRY_AFTER_FAILURE
-            await _react(REACTION_FAIL)
             return "森空岛登录已失效，请发送 /skl绑定 重新扫码" if "登录" in missed else "森空岛暂时没有返回你的战绩，请稍后再试"
         counted_at, standings = load_board()
         before = next((s for s in standings if s.owner == owner), None)
@@ -693,7 +664,6 @@ async def _refresh_one(qq: str) -> str:
     finally:
         _collecting.release()
     _refreshed[qq] = time.monotonic()  # 冷却从更新完成时算起
-    await _react(REACTION_DONE)
     if row is None:
         return f"你还没有{season_title()}的对局记录"
     shown = visible(standings, ids)
@@ -741,7 +711,6 @@ async def _(bot: Bot, event: MessageEvent, user_session: UserSession, arg: Messa
         optout = _load_optout()
         (optout.add if action == "退出" else optout.discard)(qq)
         write_json(OPTOUT_FILE, sorted(optout))
-        await _react(REACTION_DONE)
         await garrison_board.finish("已退出卫戍榜，不会再出现在榜单上" if action == "退出" else "已重新加入卫戍榜")
     if action == "刷新":
         if qq not in {str(s) for s in driver.config.superusers}:
@@ -754,7 +723,7 @@ async def _(bot: Bot, event: MessageEvent, user_session: UserSession, arg: Messa
             why = "；".join(f"{reason} {count} 人" for reason, count in last_reasons.most_common(5))
             await garrison_board.send(f"卫戍榜统计完成：{counted} 人上榜" + (f"，{failed} 人这次没读到（沿用上一次的数字）\n原因：{why}" if failed else ""))
         except ActionFailed as e:  # 统计超过了平台允许回复的时限，而该群不让机器人主动发言
-            logger.info(f"Arknights stronghold board: the count is done, but the reply could not be sent ({e.retcode})")
+            logger.info(f"Arknights stronghold board: the count is done, but the reply could not be sent ({e.info.get('retcode')})")
         await garrison_board.finish()
     if action == "更新":
         await garrison_board.finish(await refresh_one(qq), at_sender=True)
@@ -764,21 +733,16 @@ async def _(bot: Bot, event: MessageEvent, user_session: UserSession, arg: Messa
     counted_at, standings = load_board()
     if not counted_at:
         await garrison_board.finish("卫戍榜还没有统计过，每天 10:30 刷新")
-    await _react(REACTION_PROCESSING)
     try:
         names, ids = await _names(bot, event, standings)
         rows = visible(standings, ids)
         image = await ef_theme.render_page(render.board(rows, names, user_session.user_id, counted_at, season=board_season()), render.BOARD_WIDTH, scale=render.SCALE, quality=render.QUALITY)
         await UniMessage.image(raw=image).send(reply_to=True)
         if any(s.owner == user_session.user_id for s in rows):  # 只给榜上有他的人（没打过、退出了的不给）
-            await send_buttons("**卫戍榜**", [[("更新我的成绩", "/卫戍榜 更新")]], fallback=True)
+            # 无文字兜底：图后附带的下一步，按钮发不出就算了
+            await send_buttons("**卫戍榜**", [[("更新我的成绩", "/卫戍榜 更新")]])
     except MatcherException:
         raise
     except Exception as e:
-        if upload_timed_out(e):  # 图已经做好，只是上传太久
-            logger.warning("Arknights stronghold board: picture upload timed out")
-            await garrison_board.finish(SLOW_UPLOAD)
         logger.opt(exception=e).warning(f"Arknights stronghold board failed: {type(e).__name__}")
-        await _react(REACTION_FAIL)
         await garrison_board.finish("卫戍榜生成失败，请稍后再试")
-    await _react(REACTION_DONE)

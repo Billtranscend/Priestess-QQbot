@@ -39,7 +39,7 @@ from nonebot.params import Command, CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 
-from plugins.quick_buttons import Rows, _commands_in, can_show_buttons, rows_of, send_buttons, send_menu
+from plugins.quick_buttons import Rows, rows_of, send_buttons
 from plugins.strict_command import strict
 
 require("nonebot_plugin_apscheduler")
@@ -59,7 +59,6 @@ from plugins.endfield_wiki.lookup import normalize, to_pinyin
 from . import stages
 from .builds import HOLDING_MIN_LEVEL, BuildStore
 from .echoes import EchoStore, partners, speed_ranking, usage_rates
-from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, react as _react
 
 __plugin_meta__ = PluginMetadata(
     name="Endfield stage guide",
@@ -245,7 +244,6 @@ async def _rich_css() -> None:
 
 async def _send_page(matcher, build, fallback: str) -> None:
     """渲染并发送菜单页；`build` 返回其 HTML。失败时改发纯文本。"""
-    await _react(REACTION_PROCESSING)
     try:
         await _rich_css()
         image = await ef_theme.render_page(await build(), stages.WIDTH, height=300, template_path=wiki.DATA_DIR.as_uri())
@@ -254,9 +252,7 @@ async def _send_page(matcher, build, fallback: str) -> None:
         raise
     except Exception as e:
         logger.warning(f"Stage menu failed: {type(e).__name__}: {e}")
-        await _react(REACTION_FAIL)
         await matcher.finish(fallback)
-    await _react(REACTION_DONE)
 
 
 
@@ -469,7 +465,6 @@ async def _(event: MessageEvent, arg: Message = CommandArg()) -> None:
     if action not in ("退出", "加入"):
         await stats_opt.finish("用法：/攻略统计 退出  或  /攻略统计 加入\n（竞速榜、/干员统计 和资料卡上的常用队友会使用已绑定群友的战争回响 / 影拓丰碑最佳记录和干员持有情况）")
     echo_store.set_optout(str(event.user_id), action == "退出")
-    await _react(REACTION_DONE)
     await stats_opt.finish("已退出统计，你的记录不会再被收集，也不会出现在竞速榜上" if action == "退出" else "已重新加入通关阵容统计，下次更新后生效", at_sender=True)
 
 
@@ -487,7 +482,6 @@ async def _(event: MessageEvent) -> None:
         await speed_refresh.finish(f"你 {ago}已更新成功，成绩已在榜上；{int(REFRESH_COOLDOWN // 60)} 分钟内不用重复更新", at_sender=True)
     _refreshing.add(qq)
     _refreshed[qq] = time.monotonic()
-    await _react(REACTION_PROCESSING)
     try:
         outcome, before, after = await echo_store.refresh(qq)
     except Exception as e:
@@ -503,7 +497,6 @@ async def _(event: MessageEvent) -> None:
     else:
         _refreshed.pop(qq, None)  # 什么也没读：可以马上重试
     if outcome != "ok":
-        await _react(REACTION_FAIL)
         await speed_refresh.finish({
             "busy": "全员战绩正在更新中，结束后榜单就会包含你的最新记录，不用再发",
             "optout": "你已退出攻略统计，记录不会被收集。发 /攻略统计 加入 重新加入后再更新",
@@ -522,7 +515,6 @@ async def _(event: MessageEvent) -> None:
         lines.append(f"新增 {len(fresh)} 关通关记录")
     if not faster and not fresh:
         lines.append("没有比上次更快的成绩")
-    await _react(REACTION_DONE)
     await speed_refresh.finish("\n".join(lines), at_sender=True)
 
 
@@ -607,7 +599,6 @@ table.stats tr.hd td.g { border-left: 1px solid var(--ef-line); }
 BOARD_WIDTH = 1000
 ENDMIN_IDS = {"chr_0003_endminf": "chr_0002_endminm", "chr_9000_endmin": "chr_0002_endminm"}
 BOARD_FOOT = "用时与阵容来自森空岛最佳记录，精确到秒；阵容数字为 等级·潜能。数据每天 05:30、17:30 起陆续更新<br>不想上榜可发 /攻略统计 退出"
-SPEED_NEXT = "想马上更新自己的记录发 /竞速更新，其他榜单发 /竞速榜"
 
 
 def _rank(n: int) -> str:
@@ -657,7 +648,6 @@ SPEED_MENU = (
     "　/丰碑竞速 → 选择要查的丰碑\n"
     "\n关卡名记不清？本周关卡发 /战争回响，丰碑关卡发 /影拓丰碑"
 )
-SPEED_MENU_COMMANDS = ("/回响竞速", "/丰碑竞速")  # SPEED_MENU 列出的选项：提问的人发了其中一条，文字菜单就算选过了
 
 
 def _parse_board_args(arg: Message) -> tuple[str, str | None]:
@@ -690,7 +680,6 @@ def _monument_menu(endgame: dict) -> str:
 
 
 async def _send_speed(bot: Bot, event: MessageEvent, matcher, groups: list[dict], difficulty: str | None, title: str, subtitle: str) -> None:
-    await _react(REACTION_PROCESSING)
     try:
         pool, names = await _member_pool(bot, event)
         data = _load_echoes()
@@ -700,22 +689,15 @@ async def _send_speed(bot: Bot, event: MessageEvent, matcher, groups: list[dict]
         for g in groups:
             diff = difficulty if difficulty and any(s["difficulty"] == difficulty for s in g["stages"]) else _top_difficulty(g)
             cards.append(await _speed_card(data, pool, names, g, diff, requester, limit))
-        image = await _board_page(title, subtitle, "".join(cards), _speed_foot())
+        image = await _board_page(title, subtitle, "".join(cards))
         await UniMessage.image(raw=image).send()
     except MatcherException:
         raise
     except Exception as e:
         logger.warning(f"Speed board failed: {type(e).__name__}: {e}")
-        await _react(REACTION_FAIL)
         await matcher.finish("竞速榜生成失败，请稍后再试")
-    # 无文字兜底：结果页后面不另发消息，显示不了按钮时这两条指令写在页脚里（_speed_foot）
+    # 无文字兜底：结果页后面不另发消息，按钮发不出就算了
     await send_buttons("**竞速榜**", [[("更新我的记录", "/竞速更新"), ("其他榜单", "/竞速榜")]])
-    await _react(REACTION_DONE)
-
-
-def _speed_foot() -> str:
-    """竞速榜的页脚。显示不了按钮的机器人上多写一句下一步；官方机器人图后就是这两个按钮，图里不重复。"""
-    return BOARD_FOOT if can_show_buttons() else f"{BOARD_FOOT}<br>{SPEED_NEXT}"
 
 
 def _single_title(group: dict) -> tuple[str, str]:
@@ -729,9 +711,7 @@ async def _(bot: Bot, event: MessageEvent, arg: Message = CommandArg()) -> None:
     query, difficulty = _parse_board_args(arg)
     endgame = _endgame()
     if not query:
-        # 无文字兜底：按钮没发出时下一行发 SPEED_MENU，按它自己列出的指令认选择（与按钮的不同）
-        if not await send_buttons("**竞速榜** 请选择要查询的榜单", _speed_buttons(endgame)):
-            await send_menu(SPEED_MENU, SPEED_MENU_COMMANDS)
+        await send_buttons("**竞速榜** 请选择要查询的榜单", _speed_buttons(endgame), fallback=SPEED_MENU)
         await speed_board.finish()
     if query in ("回响", "战争回响", "回响竞速"):
         await speed_board.finish("请发 /回响竞速（本周全部关卡）或 /回响竞速 关卡名")
@@ -746,7 +726,7 @@ async def _(bot: Bot, event: MessageEvent, arg: Message = CommandArg()) -> None:
         await _send_monument_series(bot, event, speed_board, found[1], difficulty)
     else:
         hint = f"找到多个关卡：{'、'.join(found[1])}" if found else f"没有找到「{query}」"
-        await send_menu(hint + "\n\n" + SPEED_MENU, SPEED_MENU_COMMANDS)
+        await speed_board.send(hint + "\n\n" + SPEED_MENU)
         await speed_board.finish()
 
 
@@ -798,7 +778,7 @@ async def _(bot: Bot, event: MessageEvent, arg: Message = CommandArg()) -> None:
         await monument_speed.finish(f"「{found[1]['name']}」是战争回响关卡，请发 /回响竞速 {found[1]['name']}")
     else:
         hint = f"找到多个：{'、'.join(found[1])}" if found else f"没有找到丰碑「{query}」"
-        await send_menu(hint + "\n\n" + _monument_menu(endgame), _commands_in(_monument_buttons(endgame, "/丰碑竞速")))
+        await monument_speed.send(hint + "\n\n" + _monument_menu(endgame))
         await monument_speed.finish()
 
 
@@ -866,7 +846,6 @@ async def _(arg: Message = CommandArg()) -> None:
     if scope is None:
         await operator_stats.finish(f"没有找到「{arg.extract_plain_text().strip()}」\n{STATS_USAGE}")
     keys, label = scope
-    await _react(REACTION_PROCESSING)
     try:
         optout = echo_store.optout()
         roles, held = build_store.holdings(optout)
@@ -879,7 +858,6 @@ async def _(arg: Message = CommandArg()) -> None:
         for cid, n in raw.items():
             used[operators.get(ENDMIN_IDS.get(cid, cid), {}).get("name", cid)] += n
         if not roles and not clears:
-            await _react(REACTION_DONE)
             await operator_stats.finish("干员统计数据还在收集，请稍后再试")
         body = await _stats_body(roles, held, clears, used, label, players)
         image = await _board_page("终末地 · <em>6★ 干员统计</em>", "全部绑定玩家（不分群）的持有率、持有者平均潜能和高难关卡出场率", body, STATS_FOOT, "Endfield · Operator Stats")
@@ -888,13 +866,11 @@ async def _(arg: Message = CommandArg()) -> None:
         raise
     except Exception as e:
         logger.warning(f"Operator stats failed: {type(e).__name__}: {e}")
-        await _react(REACTION_FAIL)
         await operator_stats.finish("干员统计生成失败，请稍后再试")
     scopes = (("全部关卡", "/干员统计"), ("本周战争回响", "/干员统计 战争回响"), ("影拓丰碑", "/干员统计 影拓丰碑"))
     shown = {"": scopes[0][1], "战争回响": scopes[1][1], "本周": scopes[1][1], "影拓丰碑": scopes[2][1]}.get(arg.extract_plain_text().strip())
     # 无文字兜底：结果页后面不另发消息，页脚已写明可加的范围（STATS_FOOT）
     await send_buttons("**干员统计** 换个范围看出场率", [[scope for scope in scopes if scope[1] != shown]])
-    await _react(REACTION_DONE)
 
 
 # ── 定时采集 ───────────────────────────────────────────────────────────

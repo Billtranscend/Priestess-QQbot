@@ -17,6 +17,14 @@
 导入结果由（小黑盒的回答，官方行）决定。官方行也可能在导入之后才到：新绑定的第一次同步，
 或者每晚同步还没拉到的抽卡。这些行覆盖的抽卡必须从导入里去掉，否则会重复计数，所以小黑盒的
 回答会保存下来，每当新增官方行时就据此重建导入（`reconcile`）。
+
+小黑盒账号绑定的游戏 UID 和成员绑定的那款游戏的角色都对不上时，那款游戏不导入，记下这次尝试（只在内存里，
+RETRY_WINDOW 秒内有效）。成员在这期间用 /skl添加账号 绑上了那个角色，这款游戏的抽卡同步一结束就自动再导入一次，
+导入到的角色不是默认角色时顺便切换成默认，在他发指令的地方告诉他结果（`_retry`）。他没等同步结束、自己又发了
+/导入小黑盒，导入到这期间新绑的角色时也一样切换。
+
+其余手动导入补回的记录不在默认角色上时不切换：回复里提醒一句，下面再跟一个切换到那个角色的按钮（`_role_note`）。
+按钮是菜单，由 plugins/quick_buttons.py 撤回。
 """
 
 from __future__ import annotations
@@ -27,14 +35,15 @@ import json
 import socket
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from nonebot import logger, on_command, require
 from nonebot.adapters import Message
-from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent
-from nonebot.exception import MatcherException
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent, MessageSegment, PrivateMessageEvent
+from nonebot.matcher import current_event
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
@@ -66,11 +75,13 @@ from sqlalchemy import delete, event, func, insert, select
 
 from plugins import skland_ark_gacha as ark_gacha
 from plugins import skland_auto_gacha as auto_gacha
+from plugins.quick_buttons import Rows, send_buttons
+from plugins.skland_roles import default_role, other_roles, switch_default
 from plugins.strict_command import command_ends_cleanly, strict
 
 from .ark_plan import UNRECORDED, GamePool, build_ark_plan
 from .plan import Official, Plan, build_plan
-from plugins.shared import REACTION_DONE, REACTION_FAIL, REACTION_PROCESSING, tell_superusers, write_json, react as _react
+from plugins.shared import first_bot, tell_superusers, write_json
 
 __plugin_meta__ = PluginMetadata(
     name="Heybox gacha import",
@@ -90,6 +101,7 @@ FETCH_ATTEMPTS = 3
 RECONCILE_DELAY = 10  # 官方行写入后等几秒；它的事务得先提交
 RECONCILE_ATTEMPTS = 3
 QUEUE_WAIT = 300  # 前面有人在导入时最多排队等多少秒（一次导入两款游戏，通常半分钟左右）
+RETRY_WINDOW = 3300  # UID 对不上的那次导入记多久：官方机器人只能在 3500 秒内回复一条消息，回复里说“一小时内”
 CN = timezone(timedelta(hours=8))
 
 async def _id_may_follow(event: Event, state: T_State) -> bool:
@@ -99,7 +111,7 @@ async def _id_may_follow(event: Event, state: T_State) -> bool:
 
 import_cmd = on_command("导入小黑盒", rule=Rule(_id_may_follow), priority=5, block=True)
 _lock = asyncio.Lock()
-_last_run: dict[int, float] = {}
+_last_run: dict[tuple[int, str], float] = {}
 _running: set[int] = set()  # 正在导入（含排队）的成员：重复发送时不再排第二次
 
 
@@ -131,6 +143,12 @@ RECEIVED = "正在为你拉取{games}小黑盒抽卡记录"
 QUEUED = "。前面还有人在导入，轮到你会自动开始"
 STILL_RUNNING = "导入进行中，完成后会回复结果，请稍等"
 NO_DATA_SKIP = "小黑盒里没有{game}的抽卡分析数据（没绑定{game}，或还没点过更新），已跳过"
+MISMATCH = "没有导入：这个小黑盒账号绑定的{game} UID 和你在我这里绑定的{game}角色都对不上"
+IMPORT_FAILED = "导入失败"
+RETRY_HINT = (  # 指令单独成句，skland_shortcuts 才会在下面挂 /skl添加账号 按钮
+    "如果小黑盒绑定的{games}号在你的另一个森空岛账号上，可以把那个账号也绑上来。"
+    "发送 /skl添加账号 绑定，一小时内绑好的话，我会自动用这个小黑盒 ID 再导入一次{games}。"
+)
 
 
 def _uid(character: Character) -> str:
@@ -342,9 +360,7 @@ def _game_pools() -> list[GamePool]:
     return [GamePool(p.gachaPoolId, p.gachaPoolName, p.openTime, p.endTime) for p in gacha_table_data.gacha_table]
 
 
-async def _ark_rows(session, character, plan: Plan) -> tuple[Plan, list[dict]]:
-    if plan.error or not plan.rows:
-        return plan, []
+async def _ark_rows(session, character, plan: Plan) -> list[dict]:
     wanted = {row["pool_id"] for row in plan.rows}
     names = dict(  # 官方行里的卡池名称（如“联合行动”），游戏表里很多卡池只有一个通用名
         (await session.execute(
@@ -359,11 +375,11 @@ async def _ark_rows(session, character, plan: Plan) -> tuple[Plan, list[dict]]:
         }
         for row in plan.rows
     ]
-    return plan, rows
+    return rows
 
 
-async def _build(session, character, result: dict) -> tuple[Plan, list[dict]]:
-    """该角色的导入计划，以及它对应的数据库行。"""
+async def _plan(session, character, result: dict) -> Plan:
+    """该角色的导入计划（按它现有的官方行）。"""
     official = [
         Official(pool_id, name, rarity, int(ts), pos, bool(is_free))
         for pool_id, name, rarity, ts, pos, is_free in await session.execute(
@@ -372,12 +388,18 @@ async def _build(session, character, result: dict) -> tuple[Plan, list[dict]]:
         )
     ]
     if character.app_code == "arknights":
-        return await _ark_rows(session, character, build_ark_plan(result, _uid(character), official, _game_pools()))
-    plan = build_plan(result, str(character.role_id), official, _pool_windows())
+        return build_ark_plan(result, _uid(character), official, _game_pools())
+    return build_plan(result, str(character.role_id), official, _pool_windows())
+
+
+async def _rows(session, character, plan: Plan) -> list[dict]:
+    """计划对应的数据库行：补上物品 id 和卡池名称（终末地要查全部成员的官方行，所以只在真要写入时做）。"""
     if plan.error or not plan.rows:
-        return plan, []
+        return []
+    if character.app_code == "arknights":
+        return await _ark_rows(session, character, plan)
     ids, pool_names = await _known_names(session)
-    rows = [
+    return [
         {
             "character_id": character.id,
             "item_type": row["item_type"], "pool_id": row["pool_id"],
@@ -387,7 +409,11 @@ async def _build(session, character, result: dict) -> tuple[Plan, list[dict]]:
         }
         for row in plan.rows
     ]
-    return plan, rows
+
+
+def _compared(row: dict) -> tuple:
+    """重建前后比较的内容，和 reconcile 从数据库读出的 key 一一对应（明日方舟的计划没有免费抽，按 False）。"""
+    return row["pool_id"], row["ts"], row["pos"], row["name"], row.get("is_free", False)
 
 
 async def _replace(session, character_id: int, rows: list[dict]) -> None:
@@ -398,7 +424,8 @@ async def _replace(session, character_id: int, rows: list[dict]) -> None:
 
 async def run_import(session, character, result: dict) -> Plan:
     """用 `result` 重新生成的导入替换该角色之前的导入；成功后提交。"""
-    plan, rows = await _build(session, character, result)
+    plan = await _plan(session, character, result)
+    rows = await _rows(session, character, plan)
     if rows:
         await _replace(session, character.id, rows)
         await session.commit()
@@ -453,13 +480,13 @@ async def reconcile(character_id: int) -> str:
         before = sorted(tuple(row) for row in await session.execute(select(*key).where(*_imported(character_id))))
         if not before:
             return "nothing imported"
-        plan, rows = await _build(session, character, snapshot["result"])
+        plan = await _plan(session, character, snapshot["result"])
         if plan.error:
             return "snapshot rejected"
-        after = sorted((row["pool_id"], row["gacha_ts"], row["pos"], row["char_name"], row["is_free"]) for row in rows)
+        after = sorted(_compared(row) for row in plan.rows)
         if after == before:
             return "unchanged"
-        await _replace(session, character_id, rows)
+        await _replace(session, character_id, await _rows(session, character, plan))
         await session.commit()
     return f"{len(before)} -> {len(after)} rows"
 
@@ -506,6 +533,8 @@ async def _after_official_sync(owner_id: int, status: str, records: int, final: 
             roles = [role.id for role in await _roles(owner_id, session, app_code)]
         for character_id in roles:
             _schedule_reconcile(character_id, 1)
+    if final:
+        await _retry_if_bound(owner_id, app_code)
 
 
 async def _after_ark_sync(owner_id: int, status: str, records: int, final: bool) -> None:
@@ -520,7 +549,7 @@ if _after_ark_sync not in ark_gacha.sync_listeners:
 
 
 def fetch_failure_text(error: Exception) -> str:
-    """读不到小黑盒时告诉成员的原因（光给一个失败表情不够）。"""
+    """读不到小黑盒时告诉成员的原因。"""
     if isinstance(error, HeyboxRefused):
         said = f"：{error.args[0]}" if error.args and error.args[0] else ""
         return f"导入失败：小黑盒拒绝了这次查询{said}，没有写入任何数据。请过几分钟再试"
@@ -567,42 +596,68 @@ def summary(plan: Plan, app_code: str = "endfield") -> str:
     return "\n".join(lines)
 
 
-async def _import_game(app_code: str, user_id: int, heybox_id: str, session) -> tuple[str, str]:
-    """导入一款游戏，返回 (结果, 给成员的话)。不在这里结束指令。
+@dataclass(frozen=True)
+class GameImport:
+    """一款游戏的导入结果。"""
+
+    outcome: str  # 见 _import_game
+    text: str  # 给成员的话
+    heybox_uid: str = ""  # 小黑盒账号绑定的这款游戏的 UID，读到数据时才有
+    role_id: int = 0  # 导入到的角色，读到数据且 UID 对上时才有
+    role_name: str = ""  # 这个角色在回复里的叫法
+
+
+ARK_SERVERS = {"1": "官服", "2": "bilibili服"}  # 同 /skl角色 卡片的叫法
+
+
+def _role_name(character: Character) -> str:
+    """回复里怎么叫这个角色：昵称；明日方舟加上区服（同一账号可能官服、bilibili服各有一个同名角色）。"""
+    if character.app_code == "endfield":
+        return character.nickname
+    return f"{character.nickname}（{ARK_SERVERS.get(character.channel_master_id, character.server_name)}）"
+
+
+async def _import_game(app_code: str, user_id: int, heybox_id: str, session) -> GameImport:
+    """导入一款游戏。不在这里结束指令。
 
     结果：imported 补回了记录；nothing 小黑盒没有更早的记录；no_role 成员没有这款游戏的角色；
-    no_data 小黑盒账号里没有这款游戏的数据；cooldown 刚导入过；failed 出错，没有写入。
+    no_data 小黑盒账号里没有这款游戏的数据；mismatch 小黑盒账号的游戏 UID 和成员的角色都对不上；
+    cooldown 刚导入过；failed 出错，没有写入。
     """
     game = GAMES[app_code]
     roles = await _roles(user_id, session, app_code)  # 每款游戏重新查：前一款回滚后旧对象已过期
     if not roles:
-        return "no_role", NO_ROLE_SKIP.format(game=game)
+        return GameImport("no_role", NO_ROLE_SKIP.format(game=game))
     wait = COOLDOWN - (time.time() - _last_run.get((user_id, app_code), 0))
     if wait > 0:
         logger.info(f"Heybox import ({app_code}) skipped: imported {int(COOLDOWN - wait)} s ago")
-        return "cooldown", f"刚导入过，请 {int(wait // 60) + 1} 分钟后再试"
+        return GameImport("cooldown", f"刚导入过，请 {int(wait // 60) + 1} 分钟后再试")
     try:
         result = await (fetch_overview if app_code == "endfield" else fetch_ark_analysis)(heybox_id)
     except HeyboxLoginExpired:
         logger.warning("Heybox import: the saved Heybox login is missing or expired")
         await _tell_login_lost()
-        return "failed", LOGIN_LOST
+        return GameImport("failed", LOGIN_LOST)
     except Exception as e:
         logger.warning(f"Heybox fetch ({app_code}) failed: {type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")  # Playwright 的调用日志里会出现小黑盒 id（所以只记第一行）
-        return "failed", fetch_failure_text(e)
+        return GameImport("failed", fetch_failure_text(e))
     if not _has_data(app_code, result):
         logger.info(f"Heybox import ({app_code}) skipped: no data for this game on the Heybox account")
-        return "no_data", NO_DATA_SKIP.format(game=game)
+        return GameImport("no_data", NO_DATA_SKIP.format(game=game))
     try:
         # 小黑盒账号会指明它的角色；导入就放到那个角色下，不管它是成员的哪一个角色。
         heybox_uid = str((result.get("user_info") or {}).get("uid"))
-        character = next((role for role in roles if _uid(role) == heybox_uid), roles[0])
-        key = _snapshot_key(character)  # ORM 对象在提交后会过期；先留下普通值，供之后使用
+        character = next((role for role in roles if _uid(role) == heybox_uid), None)
+        if character is None:
+            logger.info(f"Heybox import ({app_code}) skipped: the Heybox account's game UID matches none of the member's roles")
+            return GameImport("mismatch", MISMATCH.format(game=game), heybox_uid)
+        # ORM 对象在提交后会过期；先留下普通值，供之后使用
+        key, role_id, role_name = _snapshot_key(character), character.id, _role_name(character)
         plan = await run_import(session, character, result)
     except Exception as e:
         await session.rollback()
         logger.opt(exception=True).error(f"Heybox import ({app_code}) failed while building or writing rows: {type(e).__name__}: {e}")
-        return "failed", "导入时程序出错，没有写入任何数据。问题已记录，请稍后再试"
+        return GameImport("failed", "导入时程序出错，没有写入任何数据。问题已记录，请稍后再试")
     if plan.rows and not plan.error:
         _last_run[(user_id, app_code)] = time.time()
         with contextlib.suppress(Exception):
@@ -612,12 +667,13 @@ async def _import_game(app_code: str, user_id: int, heybox_id: str, session) -> 
         f"skipped={len(plan.skipped)} heybox_pulls={plan.heybox_pulls} official_pulls={plan.official_pulls}"
     )
     if plan.error:
-        return "failed", summary(plan, app_code)
-    return ("imported" if plan.imported else "nothing"), summary(plan, app_code)
+        return GameImport("failed", summary(plan, app_code), heybox_uid)
+    return GameImport("imported" if plan.imported else "nothing", summary(plan, app_code), heybox_uid, role_id, role_name)
 
 
 async def _import(matcher, user_session: UserSession, session, arg: Message) -> None:
     """/导入小黑盒：同一个小黑盒 ID 依次导入终末地和明日方舟，一条回复写两款游戏的结果。"""
+    asked_at = time.time()  # 官方机器人能回复这条消息的时间从它收到时算起
     heybox_id = arg.extract_plain_text().strip()
     if not (heybox_id.isdigit() and 4 <= len(heybox_id) <= 12):
         logger.info("Heybox import refused: usage")  # 原因只记类别，不记成员填的内容
@@ -631,11 +687,11 @@ async def _import(matcher, user_session: UserSession, session, arg: Message) -> 
     if not await _is_bound(user_id, session):
         logger.info("Heybox import refused: not bound")
         await matcher.finish(NOT_BOUND, at_sender=True)
-    games = {app_code: [_uid(role) for role in await _roles(user_id, session, app_code)] for app_code in GAMES}
+    games = {app_code: {role.id: _uid(role) for role in await _roles(user_id, session, app_code)} for app_code in GAMES}  # 角色 id -> 游戏 UID
     if not any(games.values()):
         logger.info("Heybox import refused: no role in either game")
         await matcher.finish(NO_ROLE, at_sender=True)
-    if any(heybox_id in uids for uids in games.values()):
+    if any(heybox_id in uids.values() for uids in games.values()):
         logger.info("Heybox import refused: the game UID was given")
         await matcher.finish(f"你填的是自己的游戏 UID。{WHERE_ID}，请换成小黑盒 ID 再试", at_sender=True)
     if user_id in _running:
@@ -643,31 +699,241 @@ async def _import(matcher, user_session: UserSession, session, arg: Message) -> 
         await matcher.finish(STILL_RUNNING, at_sender=True)
     _running.add(user_id)
     try:
-        await _react(REACTION_PROCESSING)
         names = "和".join(GAMES[app_code] for app_code, uids in games.items() if uids)
-        await UniMessage.text(RECEIVED.format(games=names) + (QUEUED if _lock.locked() else "")).send(at_sender=True)  # 表情回应在官方机器人上看不到：先说一句收到了
-        results: dict[str, tuple[str, str]] = {}
+        await UniMessage.text(RECEIVED.format(games=names) + (QUEUED if _lock.locked() else "")).send(at_sender=True)  # 先说一句收到了
+        results: dict[str, GameImport] = {}
         try:
             async with _queued():
                 for app_code in GAMES:
                     results[app_code] = await _import_game(app_code, user_id, heybox_id, session)
         except ImportBusy:
             logger.info(f"Heybox import refused: waited {QUEUE_WAIT} s for other imports")
-            await _react(REACTION_FAIL)
             await matcher.finish(f"现在导入的人多，排队超过 {QUEUE_WAIT // 60} 分钟了，请过一会儿再试", at_sender=True)
+        # 在 _remember 之前：要看上次 UID 对不上时他有哪些角色；仍在 _running 里，自动再导入不会同时开始
+        notes = {app_code: await _role_note(session, user_id, app_code, result) for app_code, result in results.items()}
     finally:
         _running.discard(user_id)
-    outcomes = {app_code: outcome for app_code, (outcome, _) in results.items()}
-    lines = [f"【{GAMES[app_code]}】{text}" for app_code, (_, text) in results.items()]
+    _remember(user_id, heybox_id, results, games, asked_at)
+    outcomes = {app_code: result.outcome for app_code, result in results.items()}
+    lines = [f"【{GAMES[app_code]}】{result.text}{notes[app_code][0]}" for app_code, result in results.items()]
     if all(outcome in ("no_data", "no_role") for outcome in outcomes.values()):  # 有角色的游戏一个都没读到：多半填错了 ID
         lines.append("这个小黑盒 ID 下没有读到任何游戏的抽卡数据。请确认填的是小黑盒 App 个人主页里的 ID 数字（不是游戏 UID），并且已经在小黑盒的「抽卡分析」里登录游戏账号、点过更新")
-    await _react(REACTION_DONE if "imported" in outcomes.values() or "failed" not in outcomes.values() else REACTION_FAIL)
-    await UniMessage.text("\n\n".join(lines)).send(at_sender=True)
+    if mismatched := [app_code for app_code, outcome in outcomes.items() if outcome == "mismatch"]:
+        lines.append(RETRY_HINT.format(games="和".join(GAMES[app_code] for app_code in mismatched)))
+    text = "\n\n".join(lines)
+    if mismatched and all(outcome in ("mismatch", "no_data", "no_role", "failed") for outcome in outcomes.values()):  # 一款也没导入
+        text = f"{IMPORT_FAILED}\n{text}"
+    await UniMessage.text(text).send(at_sender=True)
+    if offers := {app_code: offer for app_code, (_, offer) in notes.items() if offer is not None}:
+        # 无文字兜底：回复里已经写了想切换发什么
+        await send_buttons(SWITCH_CARD, _switch_rows(offers))
 
 
 @import_cmd.handle()
 async def _(event: MessageEvent, user_session: UserSession, session: async_scoped_session, arg: Message = CommandArg()) -> None:
     await _import(import_cmd, user_session, session, arg)
+
+
+# ── 导入到的不是默认角色 ───────────────────────────────────────────────
+
+SWITCHED = "\n我已把你的{game}默认角色切换为 {name}，{record} 和 {board} 现在看的就是它；想换回原来的角色发 {switch}"
+OTHER_ROLE = "\n记录导入到了你的另一个{game}角色 {name}，默认角色没变，{record} 看的还是默认角色；想切换可以发 {switch}"
+NO_DEFAULT = "\n记录导入到了你的{game}角色 {name}；你还没有设置{game}默认角色，{record} 要设置后才能看，想设成它可以发 {switch}"
+SWITCH_CARD = "要切换默认角色可以点这里"
+COMMANDS = {  # 抽卡记录、欧非榜、切换默认角色
+    "endfield": ("/zmd抽卡记录", "/zmd欧非榜", "/skl切换终末地角色"),
+    "arknights": ("/mrfz抽卡记录", "/mrfz欧非榜", "/skl切换方舟角色"),
+}
+Offer = tuple[int, str]  # 可以切换过去的角色：/skl切换…角色 的序号，昵称
+
+
+async def _switched(session, owner_id: int, app_code: str, result: GameImport) -> str:
+    """把这款游戏的默认角色换成导入到的角色。换了返回告诉成员的那句，没换为空。"""
+    try:
+        switched = await switch_default(session, owner_id, result.role_id, app_code)
+    except Exception as e:  # 导入已经写好了：换不了默认角色，也照样告诉成员导入的结果
+        logger.warning(f"Heybox import ({app_code}): default role not switched ({type(e).__name__})")
+        return ""
+    if not switched:
+        return ""
+    record, board, switch = COMMANDS[app_code]
+    return SWITCHED.format(game=GAMES[app_code], name=result.role_name, record=record, board=board, switch=switch)
+
+
+async def _other_role(session, owner_id: int, app_code: str, role_id: int) -> tuple[Offer, bool] | None:
+    """这个角色不是成员这款游戏的默认角色时：它的序号和昵称，成员有没有默认角色。"""
+    try:
+        others = await other_roles(session, owner_id, app_code)
+        offer = next(((number, role.nickname) for number, role in others if role.id == role_id), None)
+        return None if offer is None else (offer, await default_role(session, owner_id, app_code) is not None)
+    except Exception as e:  # 只是提醒：查不了就不提
+        logger.warning(f"Heybox import ({app_code}): roles not looked up for the default-role note ({type(e).__name__})")
+        return None
+
+
+async def _role_note(session, owner_id: int, app_code: str, result: GameImport) -> tuple[str, Offer | None]:
+    """手动导入后接在这款游戏那段后面的话，和要给的切换按钮。UID 对不上之后新绑的角色这次对上了：
+    同自动再导入，换成默认角色。其余补回了记录、却不在默认角色上的：只提醒，给切换按钮（还没有默认角色时也不替他设）。"""
+    if result.outcome not in ("imported", "nothing"):
+        return "", None
+    entry = _waiting(owner_id, app_code)
+    if entry is not None and result.role_id not in entry.games[app_code][1] and (text := await _switched(session, owner_id, app_code, result)):
+        return text, None
+    if result.outcome != "imported" or (other := await _other_role(session, owner_id, app_code, result.role_id)) is None:
+        return "", None
+    offer, has_default = other
+    record, _, switch = COMMANDS[app_code]
+    note = OTHER_ROLE if has_default else NO_DEFAULT
+    return note.format(game=GAMES[app_code], name=result.role_name, record=record, switch=switch), offer
+
+
+def _switch_rows(offers: dict[str, Offer]) -> Rows:
+    """切换按钮，一款游戏一行。"""
+    named = len(offers) > 1  # 两款都有时标签带上游戏名：两边的昵称常常一样
+    return [
+        [(f"切换到 {GAMES[app_code]} {nickname}" if named else f"切换到 {nickname}", f"{COMMANDS[app_code][2]} {number}")]
+        for app_code, (number, nickname) in offers.items()
+    ]
+
+
+# ── UID 对不上：成员绑上另一个账号后自动再导入 ─────────────────────────────
+
+STILL_MISMATCH = "你刚绑定的账号里也没有小黑盒绑定的那个{game}角色，{game}还是没有导入"
+RETRIED = "你刚绑定的账号对上了小黑盒，我已自动重新导入：\n【{game}】{text}"
+RETRY_FAILED = "我自动重新导入{game}时没成功：{text}"
+RETRY_BUSY = f"自动重新导入{{game}}时排队超时，请稍后再发一次 {COMMAND}"
+
+
+@dataclass
+class Mismatch:
+    """一次 UID 对不上的 /导入小黑盒。"""
+
+    heybox_id: str
+    games: dict[str, tuple[str, frozenset[int]]]  # 游戏 -> (小黑盒账号绑定的游戏 UID, 当时成员这款游戏的角色 id)
+    event: MessageEvent  # 成员发的那条指令：自动再导入的结果作为对它的回复
+    at: float
+
+
+_mismatches: dict[int, Mismatch] = {}  # 成员 id -> 最近一次；只在内存里
+_retries: set[asyncio.Task] = set()
+_retry_turns: dict[int, asyncio.Lock] = {}  # 成员 id -> 他的自动再导入轮流用的锁
+_retry_users: Counter[int] = Counter()  # 在用或在等这把锁的自动再导入个数，为 0 时删掉锁
+
+
+@contextlib.asynccontextmanager
+async def _retry_turn(owner_id: int):
+    """同一成员的自动再导入一个接一个：两款游戏先后同步完时，后一款等前一款做完，不会被当成手动导入跳过。
+    不同成员之间由 _queued 排队。"""
+    _retry_users[owner_id] += 1
+    try:
+        async with _retry_turns.setdefault(owner_id, asyncio.Lock()):
+            yield
+    finally:
+        _retry_users[owner_id] -= 1
+        if not _retry_users[owner_id]:
+            del _retry_users[owner_id], _retry_turns[owner_id]
+
+
+def _remember(owner_id: int, heybox_id: str, results: dict[str, GameImport], roles: dict[str, dict[int, str]], at: float) -> None:
+    """记下这次哪些游戏 UID 对不上（替换之前的记录），at 是收到指令的时间；导入成功的游戏不用再等。"""
+    for app_code, result in results.items():
+        if result.outcome in ("imported", "nothing"):
+            _forget_game(owner_id, app_code)
+    games = {app_code: (result.heybox_uid, frozenset(roles[app_code])) for app_code, result in results.items() if result.outcome == "mismatch"}
+    event = current_event.get(None)
+    if games and isinstance(event, MessageEvent):
+        _mismatches[owner_id] = Mismatch(heybox_id, games, event, at)
+
+
+def _waiting(owner_id: int, app_code: str) -> Mismatch | None:
+    """成员这款游戏还在等自动再导入的那次记录；过期的记录顺手删掉。"""
+    now = time.time()
+    for owner, entry in list(_mismatches.items()):
+        if now - entry.at > RETRY_WINDOW:
+            del _mismatches[owner]
+    entry = _mismatches.get(owner_id)
+    return entry if entry is not None and app_code in entry.games else None
+
+
+def _forget_game(owner_id: int, app_code: str, entry: Mismatch | None = None) -> None:
+    """这款游戏不用再等了：从 entry（默认成员现在的记录）里删掉，删空了就删记录。"""
+    entry = _mismatches.get(owner_id) if entry is None else entry
+    if entry is not None:
+        entry.games.pop(app_code, None)
+        if not entry.games and _mismatches.get(owner_id) is entry:
+            del _mismatches[owner_id]
+
+
+async def _retry_if_bound(owner_id: int, app_code: str) -> None:
+    """这款游戏的同步结束了：成员绑上了小黑盒的那个角色就再导入（不在这里等它），绑了别的角色就告诉他一次。"""
+    if (entry := _waiting(owner_id, app_code)) is None:
+        return
+    heybox_uid, known = entry.games[app_code]
+    async with get_session() as session:
+        roles = {role.id: _uid(role) for role in await _roles(owner_id, session, app_code)}
+    if _waiting(owner_id, app_code) is not entry:  # 查角色期间同时结束的另一次同步已经处理过了
+        return
+    if heybox_uid in roles.values():
+        task = asyncio.get_running_loop().create_task(_retry(owner_id, app_code, entry))
+        _retries.add(task)
+        task.add_done_callback(_retries.discard)
+    elif roles.keys() - known:
+        _forget_game(owner_id, app_code, entry)
+        await _answer(entry.event, STILL_MISMATCH.format(game=GAMES[app_code]))
+
+
+async def _retry(owner_id: int, app_code: str, entry: Mismatch) -> None:
+    """用 entry 记下的小黑盒 ID 再导入这款游戏，结果回复在成员发指令的地方。记录已换成新的一次、
+    或手动导入正在进行时不做：手动导入成功了会清掉记录。"""
+    async with _retry_turn(owner_id):
+        if _waiting(owner_id, app_code) is not entry or owner_id in _running:
+            return
+        _running.add(owner_id)
+        try:
+            logger.info(f"Heybox import ({app_code}): retrying after a new binding")
+            text = await _retried(owner_id, app_code, entry.heybox_id)
+        except Exception as e:
+            logger.opt(exception=True).error(f"Heybox import ({app_code}) retry failed: {type(e).__name__}")
+            text = RETRY_FAILED.format(game=GAMES[app_code], text=f"程序出错，问题已记录，请稍后再发一次 {COMMAND}")  # 不知道出错前写没写入
+        finally:
+            _running.discard(owner_id)
+            _forget_game(owner_id, app_code, entry)
+    await _answer(entry.event, text)
+
+
+async def _retried(owner_id: int, app_code: str, heybox_id: str) -> str:
+    """再导入一款游戏；导入到的角色不是默认角色就换成默认。返回告诉成员的话。"""
+    game = GAMES[app_code]
+    async with get_session() as session:
+        try:
+            async with _queued():
+                result = await _import_game(app_code, owner_id, heybox_id, session)
+        except ImportBusy:
+            return RETRY_BUSY.format(game=game)
+        if result.outcome not in ("imported", "nothing"):
+            return RETRY_FAILED.format(game=game, text=result.text)
+        return RETRIED.format(game=game, text=result.text) + await _switched(session, owner_id, app_code, result)
+
+
+async def _answer(event: MessageEvent, text: str) -> None:
+    """在成员发指令的地方回复他，同 skland_bind_sign 报告同步结果：把那条消息设为当前事件，桥接就作为回复发出。
+    群里发不出去（例如这个群不让机器人主动发言）时改为私聊。"""
+    bot = first_bot()
+    if bot is None:
+        return
+    token = current_event.set(event)
+    try:
+        if isinstance(event, GroupMessageEvent):
+            try:
+                await bot.send_group_msg(group_id=event.group_id, message=MessageSegment.at(event.get_user_id()) + " " + text)
+                return
+            except Exception as e:
+                logger.info(f"Heybox import: retry reply not delivered in the group ({type(e).__name__}); trying privately")
+        await bot.send_private_msg(user_id=int(event.get_user_id()), message=text)
+    except Exception as e:
+        logger.warning(f"Heybox import: retry reply not delivered ({type(e).__name__})")
+    finally:
+        current_event.reset(token)
 
 
 # ── 明日方舟：机器人用一个登录了的小黑盒账号去读 ─────────────────────────

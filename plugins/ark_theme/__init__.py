@@ -1,6 +1,6 @@
-"""/mrfz开盒（plugins/arknights_roster）图片用的明日方舟样式（不是 NoneBot 插件，只是一个模块）。
+"""明日方舟各图片共用的样式（不是 NoneBot 插件，只是一个模块）。
 
-目前只有 /mrfz开盒 在用；/mrfz活动 等日历图用的是 game_calendar/themes.py 里另一套明日方舟主题。
+/mrfz开盒、/卫、/卫戍榜 和 /mrfz欧非榜 在用；/mrfz活动 等日历图用的是 game_calendar/themes.py 里另一套明日方舟主题。
 相当于 ef_theme 的明日方舟版：用游戏的终端风格，而不是终末地的纸面加黄色。深石墨色面板、白字、
 细线、罗德岛蓝作强调色、游戏的稀有度配色、窄体拉丁字母标签。版面部件与 ef_theme 对应（标题板、
 分区面板、标签、页脚），让 /mrfz 的图放在 /zmd 的图旁边也不显得突兀。字体和 WebP 渲染沿用 ef_theme。

@@ -105,7 +105,8 @@ NO_ROLE = "终末地绑定下没有角色（仅移除这条空记录）"
 EXPIRED = "登录已过期"  # 唯一会导致解绑的账号状态
 ROOT = Path(__file__).resolve().parents[2]
 BACKUP_DIR = ROOT / "backups" / "skland-health"
-AUTO_GACHA_QUEUE = ROOT / "data" / "skland_auto_gacha" / "queue.sqlite3"
+AUTO_GACHA_QUEUE = ROOT / "data" / "skland_auto_gacha" / "queue.sqlite3"  # 终末地
+ARK_GACHA_QUEUE = ROOT / "data" / "skland_auto_gacha" / "ark_queue.sqlite3"  # 明日方舟
 
 checkup = on_command("森空岛体检", rule=strict, permission=SUPERUSER, priority=5, block=True)
 _lock = asyncio.Lock()
@@ -339,11 +340,12 @@ def _second_strike(character_id: int) -> bool:
 
 
 def _drop_queue(user_ids: list[int]) -> None:
-    """清掉已经没有账号的成员（所有者 id）在队列里的抽卡同步。"""
-    if not user_ids or not AUTO_GACHA_QUEUE.exists():
-        return
-    with contextlib.closing(sqlite3.connect(AUTO_GACHA_QUEUE, timeout=15)) as queue, queue:
-        queue.execute(f"delete from pending where user_id in ({','.join('?' * len(user_ids))})", user_ids)
+    """清掉已经没有账号的成员（所有者 id）在两款游戏队列里的抽卡同步。"""
+    for path in (AUTO_GACHA_QUEUE, ARK_GACHA_QUEUE):
+        if not user_ids or not path.exists():
+            continue
+        with contextlib.closing(sqlite3.connect(path, timeout=15)) as queue, queue:
+            queue.execute(f"delete from pending where user_id in ({','.join('?' * len(user_ids))})", user_ids)
 
 
 # ── 体检本身 ───────────────────────────────────────────────────────────
@@ -404,7 +406,7 @@ async def members_waiting(session) -> tuple[set[int] | None, float | None]:
     不涉及这个问题时（这里没有官方机器人，或者旧机器人还在某个群里）是空集合和 None；
     有官方机器人、却查不清楚时是 (None, None)，由调用方决定怎么办。
     """
-    bridge = sys.modules.get("plugins.official_bridge")  # 只在配置了官方机器人的地方才有；绝不从这里导入
+    bridge = sys.modules.get("plugins.official_bridge")  # 离线测试里没有它；绝不从这里导入
     if bridge is None:
         return set(), None
     try:

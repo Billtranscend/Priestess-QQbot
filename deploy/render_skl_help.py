@@ -1,6 +1,6 @@
 """不重启机器人，立即为本部署渲染 /skl帮助 图片。
 
-只要 plugins/skl_help/help.html 或影响它的设置（.env 里的 QQ_BOTS、HELP_BOT_NAME、HELP_MIGRATION_NOTE、
+只要 plugins/skl_help/help.html 或影响它的设置（.env 里的 HELP_BOT_NAME、HELP_MIGRATION_NOTE、
 HELP_BISON）有变化，机器人启动时会自己重新渲染，/skl帮助 每次请求时读取这张图；这个脚本用来立刻看到
 help.html 的改动效果。改了上述设置的话应该重启机器人：运行中的机器人按启动时的设置判断，
 会用自己渲染的版本覆盖这一张。
@@ -33,6 +33,5 @@ spec.loader.exec_module(render)
 
 options = render.settings(nonebot.get_driver().config)
 target = render.render(render.page(**options), output)
-kind = "official bot" if options["official"] else "NapCat"
-note = (", migration note" if options["official"] and options["migration"] else "") + (", Bison commands" if options["bison"] else "")
-print(f"{target} {target.stat().st_size // 1024} KB ({kind}{note}, name {options['name']})")
+note = (", migration note" if options["migration"] else "") + (", Bison commands" if options["bison"] else "")
+print(f"{target} {target.stat().st_size // 1024} KB (name {options['name']}{note})")

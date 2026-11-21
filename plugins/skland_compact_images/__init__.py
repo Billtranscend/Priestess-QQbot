@@ -26,7 +26,6 @@ from playwright.async_api import TimeoutError as PageTimeout
 require("nonebot_plugin_skland")
 from nonebot_plugin_skland import render
 from plugins.ef_theme import to_webp
-from plugins.shared import REACTION_FAIL, react
 
 TARGETS = frozenset({"ef_gacha.html.jinja2"})  # 很长的终末地页面（多页抽卡记录）
 QUALITY = 60
@@ -74,7 +73,6 @@ async def _tell_timeout() -> None:
     _told.add(matcher)
     from nonebot_plugin_alconna import UniMessage
 
-    await react(REACTION_FAIL)  # 失败表情 NapCat 上能看到；官方机器人不支持，react 会跳过
     with contextlib.suppress(Exception):
         await UniMessage.text(TIMEOUT_TEXT).send(reply_to=True)
 

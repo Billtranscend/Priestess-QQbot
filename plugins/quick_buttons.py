@@ -1,27 +1,26 @@
-"""在能显示按钮的机器人上，给回复下面挂按钮；显示不了按钮的机器人上改发文字。
+"""给回复下面挂按钮；按钮发不出时改发文字。
 
 官方机器人可以在消息下面挂几行按钮；点一下就以群友本人的名义发出一条指令（而且是真正 @ 了机器人，
-所以在任何群都能用）。OneBot 机器人做不到，由 `fallback` 给出的文字代替：
+所以在任何群都能用）。按钮发不出时（pages_of 放不下，或者平台、桥接拒收 send_card），由 `fallback` 给出的文字代替：
 
     await send_buttons("竞速榜 · 请选择", [[("本周回响", "/回响竞速")], [("幽影刻形", "/丰碑竞速 幽影刻形")]], fallback=TEXT_MENU)
     await matcher.finish()
 
-图片后面附带的下一步用 fallback=True：显示不了按钮时把这些指令写成一行“还可以发：/a、/b”。
 每个 send_buttons 调用要么带 fallback，要么在上一行写明“# 无文字兜底：<原因>”。
 
 一条消息最多五行、每行五个按钮，而一行超过三个在手机上就不好看了。放不下的行接着发第二、第三条
 消息（"标题（2/3）"）；连这样都放不下的选项就不用按钮了，改发 fallback 的文字，它没有这种限制。
 `rows_of` 把一串按钮排成行；`rows_fit` 用于标签长短不一的情况（称号），给长标签留更多位置。
 
-菜单由这里统一撤回（`_track_menus`）：按钮消息，以及显示不了按钮的机器人在群里发的文字菜单
+菜单由这里统一撤回（`_track_menus`）：按钮消息，以及带 recall_text=True 在群里发的文字菜单
 （`send_menu`，fallback 的文字也走它）。提问的人发出了其中一条指令（做出了选择），回答发出后就撤回；
-群里没人理会的，MENU_IDLE_SECONDS 后撤回。调用方不用自己记。
+群里没人理会的，MENU_IDLE_SECONDS 后撤回，没等到就停机的停机时撤回。
+调用方不用自己记。每撤回一个菜单记一行日志（会话类别和原因），供统计。
 
 在私聊里，同一个机器人还可以在消息下方放推荐指令，每条显示的就是点一下发出的文字
 （`send_hints`）：用于对某人说的第一句话，也就是欢迎语。
 
-这里不导入官方机器人的桥接插件（只有配置了官方机器人时才加载，见 bot.py）：而是在已加载的模块里查找，
-找不到就当作显示不了按钮的机器人。
+plain() 不导入桥接插件：在已加载的模块里找它的转义函数，找不到就原样返回。
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
-from nonebot import logger
+from nonebot import get_driver, logger
 from nonebot.adapters import Bot as AnyBot
 from nonebot.matcher import current_bot, current_event
 
@@ -45,7 +44,6 @@ ROWS_PER_MESSAGE = 5  # 平台限制
 MESSAGES_AT_MOST = 3  # 一条回复后面最多跟这么多条按钮消息；更长的选项交给文字菜单
 PER_ROW = 3
 LABEL_FITS = {2: 9, 3: 5}  # 一行的按钮数 -> 这一行在手机上还能完整显示的最长标签字数（估计值）
-IN_WORDS = "还可以发："  # fallback=True 时那一行文字的开头
 
 
 def rows_of(buttons: list[Button], per_row: int = PER_ROW) -> Rows:
@@ -72,24 +70,10 @@ def pages_of(rows: Rows) -> list[Rows] | None:
     return pages if 0 < len(pages) <= MESSAGES_AT_MOST else None
 
 
-def is_official_bot(bot=None) -> bool:
-    """这个机器人（默认是正在回复指令的那个）是否为经 plugins/official_bridge 接入的官方机器人。"""
-    bridge = sys.modules.get("plugins.official_bridge")
-    try:
-        return bridge is not None and isinstance(bot if bot is not None else current_bot.get(), bridge.BridgeBot)
-    except LookupError:
-        return False
-
-
 def plain(text: str) -> str:
     """普通文字放进按钮消息（按 markdown 显示）时照原样显示：用桥接的转义；没加载桥接时原样返回。"""
     bridge = sys.modules.get("plugins.official_bridge.bridge")
     return bridge.markdown_escaped(text) if bridge is not None else text
-
-
-def can_show_buttons(bot=None) -> bool:
-    """这个机器人（默认是正在回复指令的那个）能否显示按钮？用于事先决定发什么。"""
-    return is_official_bot(bot)
 
 
 def _spaced(text: str) -> str:
@@ -113,16 +97,17 @@ def _answering(bot, event) -> Iterator[None]:
         current_event.reset(tokens[1])
 
 
-async def send_buttons(title: str | list[str], rows: Rows, *, bot=None, event=None, sent: list | None = None, fallback: str | bool = False) -> bool:
+async def send_buttons(
+    title: str | list[str], rows: Rows, *, bot=None, event=None, sent: list | None = None, fallback: str = "", recall_text: bool = False
+) -> bool:
     """向正在回复的会话发送 `title`，下面挂上按钮。什么都没发出时返回 False。
 
     按钮要分几条消息时，`title` 可以是每条消息各自的文字（条数与 pages_of(rows) 相同），
     否则每条都用同一段文字，后面标上第几条。
 
-    `fallback` 是按钮发不出时的文字，按文字菜单发出（见 send_menu），发出了也返回 True：
-    - 一段文字：按钮没发出就发这段文字（代替调用方自己的文字菜单），发送失败照常抛出；
-    - True：显示不了按钮的机器人上把各按钮的指令写成一行“还可以发：/a、/b”。官方机器人的按钮被拒时
-      照旧什么都不发：这只是图后附带的提示。
+    `fallback` 是按钮发不出时（放不下，或被平台拒收）代替调用方自己的文字菜单发出的文字（见 send_menu），
+    发出了也返回 True，发送失败照常抛出；没有 fallback 时什么都不补发。
+    `recall_text=True`：fallback 的文字在群里按菜单撤回。
 
     `bot` 和 `event` 供指令结束后运行的钩子使用（那时指令的上下文已经没了）。
     给了 `sent` 的话，每条发出的按钮消息的 id 都会加进去（以便之后撤回）。
@@ -134,13 +119,13 @@ async def send_buttons(title: str | list[str], rows: Rows, *, bot=None, event=No
         return False
     if await _send_cards(title, rows, bot, event, sent):
         return True
-    return await _send_in_words(fallback, rows, bot, event)
+    return await _send_in_words(fallback, rows, bot, event, recall_text)
 
 
 async def _send_cards(title: str | list[str], rows: Rows, bot, event, sent: list | None) -> bool:
     """发按钮消息（规则见 send_buttons）；一条都没发出时返回 False。"""
     pages = pages_of(rows)
-    if not can_show_buttons(bot) or pages is None:
+    if pages is None:
         return False
     group_id, user_id = getattr(event, "group_id", None), getattr(event, "user_id", None)
     with _answering(bot, event):
@@ -159,47 +144,40 @@ async def _send_cards(title: str | list[str], rows: Rows, bot, event, sent: list
     return True
 
 
-async def _send_in_words(fallback: str | bool, rows: Rows, bot, event) -> bool:
+async def _send_in_words(fallback: str, rows: Rows, bot, event, recall_text: bool) -> bool:
     """按钮没发出时的文字（规则见 send_buttons）。"""
-    commands = _commands_in(rows)
-    if isinstance(fallback, str):
-        return bool(fallback) and await send_menu(fallback, commands, bot=bot, event=event)
-    if not fallback or not commands or can_show_buttons(bot):
-        return False
-    try:
-        return await send_menu(IN_WORDS + "、".join(commands), commands, bot=bot, event=event)
-    except Exception as e:  # 只是附加的提示：回答已经发出了
-        logger.info(f"Commands in words not sent ({type(e).__name__})")
-        return False
+    return bool(fallback) and await send_menu(fallback, _commands_in(rows), bot=bot, event=event, recall_text=recall_text)
 
 
-MENU_RECALL_SECONDS = 300  # 菜单在这段时间内被做出选择时撤回；更早的留着
+MENU_RECALL_SECONDS = 110  # 菜单在这段时间内被做出选择时撤回；更早的留着（平台只让撤回约两分钟内的消息）
 MENU_IDLE_SECONDS = 90  # 群里回答指令的菜单，没人理会这么久就撤回（太久的消息平台不让撤）
+SHUTDOWN_RECALL_SECONDS = 3  # 停机时撤回群菜单最多等这么久，不耽误停机
 Chat = tuple[str, int]  # ("group", 群号) 或 ("private", QQ 号)
 
 
 @dataclass
 class Menu:
-    """回答同一条消息时发出的菜单：按钮消息（分几条发的也算一个菜单），或显示不了按钮的机器人上的文字菜单。"""
+    """回答同一条消息时发出的菜单：按钮消息（分几条发的也算一个菜单），
+    或带 recall_text=True 发出的文字菜单。"""
 
     answering: int  # 所回答的那条消息的 id
     asker: str  # 发那条消息的人：只有他做出的选择才撤回这个菜单
     sent_at: float
     ids: list[int] = field(default_factory=list)
     commands: set[str] = field(default_factory=set)  # 菜单里的指令：按钮点一下发出的，或文字菜单列出的
+    recalled: bool = False  # 到时撤回时已撤回了其中的消息：等最后一条到时再记那一行日志
 
 
 _menus: dict[Chat, list[Menu]] = {}  # 还挂着的菜单
 _gone: deque[int] = deque(maxlen=500)  # 已经撤回（或试过撤回）的菜单消息，不再撤第二次
 _timers: set[asyncio.Task] = set()
+_waiting: dict[int, tuple[AnyBot, Menu]] = {}  # 群菜单里等着到时撤回的消息 -> 发出它的机器人和所属菜单
 _text_menu: ContextVar[frozenset[str] | None] = ContextVar("text_menu", default=None)  # send_menu 正在发的、要登记的文字菜单里的指令
 
 
 def _chat_of(event) -> Chat | None:
-    """消息所在的会话。群临时会话是带着群号的私聊消息，回复也发到私聊，算私聊。"""
+    """消息所在的会话。"""
     group, user = getattr(event, "group_id", None), getattr(event, "user_id", None)
-    if getattr(event, "message_type", None) == "private":
-        group = None
     try:
         return ("group", int(group)) if group else ("private", int(user)) if user else None
     except (TypeError, ValueError):
@@ -212,20 +190,51 @@ def said(event) -> str:
     return _spaced(message.extract_plain_text())
 
 
-async def _recall(bot, message_ids: list[int]) -> None:
+async def _recall(bot, message_ids: list[int], kind: str, why: str, log: bool = True) -> bool:
+    """撤回一个菜单的各条消息，撤过的跳过；撤回了其中的消息时返回 True，`log` 时还记一行：
+    会话类别（group/private）和原因（timer/clicked/shutdown）。"""
+    recalled = False
     for message_id in message_ids:
+        _waiting.pop(message_id, None)
         if message_id in _gone:
             continue
         _gone.append(message_id)
         try:
             await bot.call_api("delete_msg", message_id=message_id)
+            recalled = True
         except Exception as e:  # 例如已超过平台允许机器人撤回自己消息的时限
-            logger.info(f"A menu message not recalled ({type(e).__name__})")
+            logger.info(f"A menu message not recalled ({kind}, {why}: {type(e).__name__})")
+    if recalled and log:
+        logger.info(f"Menu recalled ({kind}, {why})")
+    return recalled
 
 
 async def _recall_when_idle(bot, message_id: int) -> None:
+    """到时撤回群菜单的一条消息。一个菜单只记一行：由它最后一条等着到时的消息来记，其中撤回了消息才记。"""
     await asyncio.sleep(MENU_IDLE_SECONDS)
-    await _recall(bot, [message_id])
+    _, menu = _waiting.get(message_id, (None, None))
+    last = menu is not None and all(i == message_id or i not in _waiting for i in menu.ids)  # 撤回前就定下：撤的时候会交错
+    if await _recall(bot, [message_id], "group", "timer", log=False) and menu is not None:
+        menu.recalled = True
+    if last and menu.recalled:
+        logger.info("Menu recalled (group, timer)")
+
+
+@get_driver().on_shutdown
+async def _recall_at_shutdown() -> None:
+    """停机时立刻撤回群里还在等着到时撤回的菜单：计时器只在内存里，重启后就没人撤了。私聊的菜单不管。
+
+    NoneBot 按登记的倒序运行停机函数（nonebot/internal/driver/_lifespan.py 的 shutdown）。本模块由 bot.py 里
+    plugins.official_bridge 之后加载的插件第一次导入（桥接和它之前的插件都不导入本模块），这个函数登记在桥接的
+    _close 和各适配器之后，所以先于它们运行：撤回时官方机器人还连着。
+    """
+    menus = {id(menu): (bot, menu) for bot, menu in _waiting.values()}.values()  # 同一个菜单的几条消息一起撤
+    if not menus:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*(_recall(bot, menu.ids, "group", "shutdown") for bot, menu in menus)), SHUTDOWN_RECALL_SECONDS)
+    except Exception as e:  # 超时也好、出错也好，都不能拦住后面的停机函数
+        logger.info(f"Menus not all recalled at shutdown ({type(e).__name__})")
 
 
 def _offered(api: str, data: dict) -> set[str] | frozenset[str] | None:
@@ -241,7 +250,7 @@ async def _track_menus(bot, exception: Exception | None, api: str, data: dict, r
     （做出了选择），回答它的第一条消息发出后就撤回那个菜单（别人发了不撤：可能是他自己打的同一条指令）。
     群里没人理会的，MENU_IDLE_SECONDS 后撤回。不是在回答成员的消息（如进群欢迎）时发的按钮留着；
     调用时带 keep=True 的按钮消息（说明性的回复，下面附上要发的指令）也留着，不算菜单。
-    文字菜单由 send_menu 交来（_text_menu）：只有显示不了按钮的机器人在群里发的才算。"""
+    文字菜单由 send_menu 交来（_text_menu）：带 recall_text=True 在群里发的。"""
     event = current_event.get(None)
     if exception is not None or not api.startswith("send_") or getattr(event, "post_type", None) != "message":
         return
@@ -265,6 +274,7 @@ async def _track_menus(bot, exception: Exception | None, api: str, data: dict, r
         menu.ids.append(message_id)
         menu.commands |= offered
         if chat[0] == "group":
+            _waiting[message_id] = bot, menu
             task = asyncio.create_task(_recall_when_idle(bot, message_id))
             _timers.add(task)
             task.add_done_callback(_timers.discard)
@@ -273,17 +283,17 @@ async def _track_menus(bot, exception: Exception | None, api: str, data: dict, r
     else:
         _menus.pop(chat, None)
     for menu in chosen:  # 在后台撤：不耽误正在发送的回答（例如图片之后等着带 @ 的按钮消息）
-        task = asyncio.create_task(_recall(bot, menu.ids))
+        task = asyncio.create_task(_recall(bot, menu.ids, chat[0], "clicked"))
         _timers.add(task)
         task.add_done_callback(_timers.discard)
 
 
-async def send_menu(text: str, commands: Iterable[str] = (), *, bot=None, event=None) -> bool:
+async def send_menu(text: str, commands: Iterable[str] = (), *, bot=None, event=None, recall_text: bool = False) -> bool:
     """向正在回复的会话发送文字菜单 `text`（列出可以发的指令），用来代替 matcher.send(text)。
 
-    显示不了按钮的机器人在群里发的，和按钮菜单一样撤回：提问的人发出了 `commands` 中的一条
+    带 recall_text=True 在群里发的，和按钮菜单一样撤回：提问的人发出了 `commands` 中的一条
     （整句相同；带占位的写法对不上，就只剩到时撤回），回答发出后撤回；没人理会的 MENU_IDLE_SECONDS 后撤回。
-    能显示按钮的机器人上（那里文字只在按钮发不出时用）和私聊里（群临时会话也是）只是发出，不撤回。
+    不带 recall_text 的，以及私聊里的，只是发出、不撤回。
     没有正在回复的会话时返回 False；发送失败照常抛出。
     """
     try:
@@ -292,7 +302,7 @@ async def send_menu(text: str, commands: Iterable[str] = (), *, bot=None, event=
     except LookupError:
         return False
     chat = _chat_of(event)
-    tracked = chat is not None and chat[0] == "group" and not can_show_buttons(bot)
+    tracked = chat is not None and chat[0] == "group" and recall_text
     token = _text_menu.set(frozenset(filter(None, map(_spaced, commands))) if tracked else None)
     try:
         with _answering(bot, event):
@@ -306,7 +316,7 @@ async def send_hints(text: str, commands: list[str], *, bot=None, event=None) ->
     """向当前私聊发送 `text`，下面列出点一下就能发送的指令。做不到时返回 False（什么都不发）。
 
     推荐指令显示的就是它发送的文字，每行一条，所以每条都必须是完整的指令。
-    仅限私聊。没有纯文字替代：显示不了时由调用方决定要不要说点什么。
+    仅限私聊。没有纯文字替代：发不出时由调用方决定要不要说点什么。
     """
     try:
         bot = bot if bot is not None else current_bot.get()
@@ -315,7 +325,7 @@ async def send_hints(text: str, commands: list[str], *, bot=None, event=None) ->
         return False
     wanted = [command for command in commands if command]
     user_id = getattr(event, "user_id", None)
-    if not can_show_buttons(bot) or not wanted or user_id is None or getattr(event, "group_id", None) is not None:
+    if not wanted or user_id is None or getattr(event, "group_id", None) is not None:
         return False
     try:
         await bot.call_api("send_hints", user_id=user_id, text=text, commands=wanted)

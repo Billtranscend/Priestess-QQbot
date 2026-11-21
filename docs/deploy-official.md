@@ -29,7 +29,7 @@
 QQ  <-->  QQ 开放平台  <-- WebSocket / HTTP -->  plugins/official_bridge  -->  NoneBot2 (bot.py) 与各插件
 ```
 
-桥接层只在设置了 `QQ_BOTS` 时加载。
+桥接层随机器人一起加载，所以 `QQ_BOTS` 必须设置。
 
 ## 部署步骤
 

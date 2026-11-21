@@ -25,9 +25,8 @@ nonebot-plugin-skland 0.7.2 把页面换成了每次查询都同步、在浏览�
 复刻武器池（"rerun_wpn_..."）同样从常驻池挪到武器池里。
 “放得下”是指成图的像素高度（MAX_HEIGHT_PX）。各卡池的高度先在浏览器里测量：页面排好版但不绘制。
 
-通过能在消息下面挂按钮的机器人（官方 QQ 机器人，plugins/quick_buttons.py），成员自己的记录一次只显示
-一类。不带参数的指令什么都不画：它回答记录里每一类卡池各一个按钮，另有一个拉取最新记录的按钮；
-选中的那一类会被画出来，其他类的按钮跟在下面。其他机器人照旧一次收到所有图片。
+成员自己的记录一次只显示一类。不带参数的指令什么都不画：它回答记录里每一类卡池各一个按钮，
+另有一个拉取最新记录的按钮；选中的那一类会被画出来，其他类的按钮跟在下面。
 
 上游的处理函数作为模块属性被替换（上游每次调用都会重新查找它），它的 `efgacha` 子指令找回了
 0.7.2 去掉的 `-u` 选项，并新增 `-k`。
@@ -68,13 +67,12 @@ from nonebot_plugin_skland.schemas.endfield.gacha.statistics import EfGroupedGac
 from nonebot_plugin_skland.schemas import CRED
 from nonebot_plugin_skland.services.auth import CredentialState, refresh_credentials
 from nonebot_plugin_skland.services.gacha import group_ef_gacha_records, sync_ef_gacha_records
-from nonebot_plugin_skland.utils.message import send_reaction
 from nonebot_plugin_user import UserSession, get_user
 from sqlalchemy import update as sql_update
 
 from plugins import ef_theme, skland_limited
-from plugins.quick_buttons import can_show_buttons, plain, send_buttons
-from plugins.shared import SLOW_UPLOAD, heybox_hint, upload_timed_out
+from plugins.quick_buttons import plain, send_buttons
+from plugins.shared import heybox_hint
 from plugins.skland_pools import POOL_CONTENT_URL
 
 LOCAL_DIR = Path(__file__).with_name("templates")
@@ -155,10 +153,6 @@ class Record(EfGroupedGachaRecord):
     @property
     def special_total_spook(self) -> int:
         return sum(pool.total_six_spook or 0 for pool in self.limited_pools)  # 不知道 UP 的卡池（None）不计歪
-
-    @property
-    def special_up_count(self) -> int:
-        return skland_limited.up_count(self.limited_pools)
 
     @property
     def special_up_avg(self) -> float | None:
@@ -576,12 +570,7 @@ async def ef_gacha_history_handler(user_session: UserSession, *args, **kwargs) -
     except (MatcherException, SklandException, PageTimeout):
         raise
     except Exception as e:
-        if upload_timed_out(e):  # 图已经做好，只是上传太久
-            logger.warning("Endfield gacha page: picture upload timed out")
-            await UniMessage.text(SLOW_UPLOAD).send(reply_to=True)
-            return
         logger.warning(f"Endfield gacha page failed: {type(e).__name__}")
-        send_reaction(user_session, "fail")
         await UniMessage.text("抽卡记录图片生成失败，请稍后再试").send(reply_to=True)
 
 
@@ -641,12 +630,10 @@ async def _ef_gacha_history(
     character_id, uid = character.id, character.uid
     role_id, server_id, nickname = character.role_id, character.channel_master_id, character.nickname
     await session.rollback()
-    send_reaction(user_session, "processing")
 
     new_count = 0
     if update:
         if not credentials.access_token:
-            send_reaction(user_session, "fail")
             await UniMessage(NO_TOKEN).send(at_sender=True)
             return
         try:
@@ -656,7 +643,6 @@ async def _ef_gacha_history(
         except SklandException as e:
             await session.rollback()
             logger.warning(f"Endfield gacha update failed: {type(e).__name__}")
-            send_reaction(user_session, "fail")
             await UniMessage(SYNC_FAILED).send(at_sender=True)
             return
     records = await get_character_gacha_records(character_id, session)
@@ -665,12 +651,11 @@ async def _ef_gacha_history(
     await session.rollback()
     if not gacha_data.total_pulls:
         await UniMessage.text("已拉取，暂时没有抽卡记录" if update else NO_RECORDS).send(reply_to=True)
-        send_reaction(user_session, "done")
         return
     kind = _kind_requested()
-    # 能提供按钮的地方，成员自己的记录一次只显示一类卡池，
+    # 成员自己的记录一次只显示一类卡池，
     # 不带参数的指令回答可选的类型：选中之前什么都不画，也用不到卡池图和头像。
-    one_at_a_time = can_show_buttons() and not target.available
+    one_at_a_time = not target.available
     menu = one_at_a_time and kind is None
     # 小黑盒提醒只对看自己记录的人说，要不要说还得看建号时间（角色卡上）
     hinting = not target.available and earliest is not None and not imported
@@ -683,10 +668,9 @@ async def _ef_gacha_history(
     if menu:
         kinds = kinds_of(gacha_data, **span)
         title, rows = kind_menu(kinds, role, gacha_data.total_pulls, new_count if update else None)
-        # 无文字兜底：只有能显示按钮的机器人走到这里；按钮被拒时下面改画第一类，其他类在图后用文字列出
+        # 无文字兜底：按钮被拒时下面改画第一类，其他类在图后用文字列出
         if kinds and await send_buttons(title + (f"\n{plain(hint)}" if hint else ""), rows):
             logger.info(f"Endfield gacha: kinds offered {kinds}, {gacha_data.total_pulls} pulls, {new_count} new")
-            send_reaction(user_session, "done")
             return
         kind = kinds[0] if kinds else None  # 按钮被拒绝了：画第一类，其他类在下面用文字列出
         if card is None and kinds:
@@ -696,7 +680,6 @@ async def _ef_gacha_history(
     pages, kinds = await render_kinds(gacha_data, avatar_url=avatar_url, nickname=nickname, role_id=role_id, **span, kind=kind)
     if not pages:
         await UniMessage.text(f"没有「{kind}」的抽卡记录，可以看的有：{'、'.join(kinds)}" if kind and kinds else NO_RECORDS).send(reply_to=True)
-        send_reaction(user_session, "done")
         return
     if len(pages) == 1:
         await UniMessage.image(raw=pages[0][1]).send(at_sender=True)
@@ -711,14 +694,11 @@ async def _ef_gacha_history(
         others = [(title, f"/zmd抽卡记录 {title}{role}") for title in kinds if title != shown]
         said = (["其他卡池：" + "　".join(command for _, command in others)] if others else []) + ([hint] if hint else [])
         await send_buttons(f"**抽卡记录** 当前：{shown}" + (f"\n{plain(hint)}" if hint else ""), [others, [("拉取最新记录", f"/zmd抽卡记录更新{role}")]], fallback="\n".join(said))
-    elif said := ([FETCHED.format(new_count)] if update and not can_show_buttons() else []) + ([hint] if hint else []):  # 没有按钮标题可写新增条数
-        await UniMessage.text("\n".join(said)).send()
     logger.info(
         f"Endfield gacha page sent: {gacha_data.total_pulls} pulls "
         f"(characters {gacha_data.char_total_pulls} + weapons {gacha_data.weapon_total_pulls}), {new_count} new, "
         f"pictures {[f'{sheet.label} x{len(sheet.columns)}' for sheet, _ in pages]}"
     )
-    send_reaction(user_session, "done")
 
 
 # ── 安装 ───────────────────────────────────────────────────────

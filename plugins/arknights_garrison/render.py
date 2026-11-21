@@ -307,7 +307,7 @@ def _page(body: str, now: float | None) -> str:
     )
 
 
-def summary(view, avatars: dict[str, str], *, page_total: int, now: float | None = None) -> str:
+def summary(view, avatars: dict[str, str], *, now: float | None = None) -> str:
     """第一张图：统计、常用策略与盟约、称号与六维评价、最近几局。"""
     records = "".join(_record(r, avatars) for r in view.records[:SUMMARY_RECORDS]) or '<div class="ak-empty">暂无战绩记录</div>'
     more = f'<small class="cjk">最近 {min(len(view.records), SUMMARY_RECORDS)} 局 · 共 {len(view.records)} 局</small>'
