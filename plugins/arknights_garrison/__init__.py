@@ -70,6 +70,7 @@ from nonebot_plugin_user import UserSession, get_user
 from sqlalchemy import select
 
 from plugins.arknights_roster import fill_avatars, _avatar
+from plugins.skland_away import paused_owners
 from plugins.shared import write_json
 from plugins.skland_roles import member_numbers
 
@@ -538,7 +539,11 @@ async def _collect(multi_only: bool) -> tuple[int, int]:
     _, before = load_board()
     kept = {s.owner: s for s in before}
     members = await _members()
-    standings: list[Standing] = []
+    async with get_session() as session:
+        away = await paused_owners(session)
+    paused = {owner for owner, _ in members if owner in away}  # 疑似已离开的人不去读：留着上次的成绩（还有角色的话）
+    members = [m for m in members if m[0] not in paused]
+    standings: list[Standing] = [s for s in before if s.owner in paused]
     if multi_only:
         members = [m for m in members if len(m[1]) > 1]
         asked = {owner for owner, _ in members}
@@ -565,7 +570,10 @@ async def _collect(multi_only: bool) -> tuple[int, int]:
     await asyncio.gather(*(worker() for _ in range(min(WORKERS, len(members)) or 1)))
     last_reasons.clear()
     last_reasons.update(members_missed)
-    save_board(time.time(), standings, season=season_title() if _resources else board_season())
+    season = season_title() if _resources else board_season()
+    if paused and season != board_season():  # 换了赛季：上季的成绩不挂到新榜上
+        standings = [s for s in standings if s.owner not in paused]
+    save_board(time.time(), standings, season=season)
     logger.info(f"Arknights stronghold board: {len(standings)} on the board of {len(members)} members, {failed} members not read at all")
     for reason, count in reasons.most_common(10):
         logger.info(f"Arknights stronghold board: roles not read x{count}: {reason}")

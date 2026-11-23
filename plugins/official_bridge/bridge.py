@@ -12,6 +12,7 @@ import base64
 import contextvars
 import os
 import re
+import sqlite3
 import time
 from collections import OrderedDict, deque
 from copy import deepcopy
@@ -38,12 +39,13 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.adapters.qq import Bot as QQBot
 from nonebot.adapters.qq import event as qe
 from nonebot.adapters.qq.exception import ActionFailed as QQActionFailed
+from nonebot.adapters.qq.exception import RateLimitException as QQRateLimited
 from nonebot.adapters.qq.models import Action, Button, InlineKeyboard, InlineKeyboardRow, Media, MessageKeyboard, MessageMarkdown, MessageReference, Permission, RenderData
 from nonebot.adapters.qq.models import MessagePromptKeyboard, PromptAction, PromptButton, PromptContent, PromptKeyboardModel, PromptRenderData, PromptRow
 from nonebot.drivers import Driver, Request
 from nonebot.matcher import current_event, current_matcher
 
-from .idmap import GROUP_BASE, SELF, IdMap
+from .idmap import GROUP_BASE, SELF, USER_BASE, IdMap
 
 GROUP, C2C = "group", "c2c"
 
@@ -58,6 +60,15 @@ EVERYONE = "<qqbot-at-everyone />"
 UNPROMPTED_REFUSED = 40_034_105  # 该群不允许机器人在没被搭话时主动发言
 MUTED_RETRY = 600.0  # 某群拒收过主动消息后，隔多少秒再试
 MEMBERS_NOT_GRANTED = 11253  # 成员名单权限是逐个机器人单独开通的
+MEMBER_PAGES = 400  # 平台成员名单最多读这么多页（每页 30 人）；到了上限还没读完的，不算读完
+MEMBER_PAGE_PACE = 1.1  # 读成员名单时任意两次请求（不分哪个群）至少隔这么多秒（文档写这个接口 60 QPM）
+MEMBERS_REFRESH_EVERY = 6 * 3600  # 一个群的平台成员名单最多隔这么多秒读一次
+MEMBERS_RETRY_AFTER = 30 * 60  # 读失败（不是没有权限）的群，隔这么久就可以再读，不必等满 MEMBERS_REFRESH_EVERY
+MEMBERS_BACKOFF = 60.0  # 平台说请求太频繁（429）时，全机器人暂停读名单的秒数；连续再遇到就翻倍
+MEMBERS_BACKOFF_MAX = 600.0
+MEMBERS_DAILY_AFTER = 15 * 3600  # 距上次读完这么久的群，每小时那一轮就再读：留出轮询和一次失败后等 6 小时，一天至少一次
+MEMBER_IDS_SEEN = "member_ids_seen"  # meta：平台名单上出现过在那个群发过言的人（名单和事件用的是同一套编号）
+GROUP_GONE_CONFIRM = 3600.0  # 平台第一次说某群不存在之后，至少隔这么久、再说一次，才当它真没了
 STITCH_GAP = 16  # 拼成一张图的两页之间的间隔像素
 FORWARD_WORDS_MAX = 2000  # 合并转发卡片的文字页合成一条消息时，每条消息的字数上限
 FORWARD_LINE_MAX = 80  # 这么短的文字页写成一行，跟在它的标题后面
@@ -386,6 +397,14 @@ class Bridge:
         self.recent: dict[tuple[str, str], deque[Inbound]] = {}
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._members_denied_until = 0.0
+        self._members_read_at: dict[str, float] = {}  # 群 OpenID -> 上次排上读它的成员名单的时间
+        self._members_lock = asyncio.Lock()  # 一次只读一个群的成员名单
+        self._members_next_at = 0.0  # time.monotonic() 到这个时刻之前不发成员名单相关的请求（全机器人共用）
+        self._members_backoff = 0.0  # 上一次 429 之后的暂停秒数；成功一次就归零
+        self._member_tasks: dict[str, asyncio.Task] = {}  # 群 OpenID -> 正在排队或在读的那一次（每群最多一个）
+        self._info_next_at = 0.0  # time.monotonic() 到这个时刻之前不发群信息请求（查群和读名单时的核对共用）
+        # 正在读成员名单的群 -> 每次读一组（读期间发言、进群的人，读期间发言、进群、退群的人，读期间进群、退群的人）
+        self._reading: dict[str, list[tuple[set[str], set[str], set[str]]]] = {}
         self.on_sent: Any = None  # 每向群里发出一段文字就调用一次，参数为（群 OpenID，文字）
         self.route: Any = None  # async (api, params) -> 应该接手该调用的另一个 OneBot 机器人，或 None
         self.other_groups: Any = None  # async () -> 那个机器人的群列表
@@ -508,18 +527,22 @@ class Bridge:
         if isinstance(event, qe.GroupMessageCreateEvent):
             author = event.author
             group_openid = event.group_openid
+            self._present(group_openid, author.member_openid)  # 先于任何写库：正在读这个群的名单时，他算在名单上
             gid = self.idmap.group_id(group_openid)
             extras = AUTHOR_EXTRAS.pop(event.id, {})
             card = str(extras.get("member_nickname") or "")
+            failed = [False]  # 这条消息里写库失败过一次，就不再逐个去写（每次都可能要等锁）
+            uid = self.idmap.user_id(author.member_openid, author.username)
+            # 先记发言人：他刚说了话，不能因为记被 @ 的人失败而留着退群标记
+            if self._note_member(gid, group_openid, author.member_openid, author.member_role, card or author.username, seen=True, at=self._timestamp(event.timestamp), failed=failed):
+                logger.info(f"official bridge: a member on record as gone from group {gid} spoke there: counted as a member again")
             for mention in extras.get("mentions") or []:  # 成员身份和名字唯一会出现的另一个地方
                 mentioned = mention.get("member_openid")
                 if mention.get("is_you"):
-                    self.idmap.touch_member(group_openid, SELF, mention.get("member_role"))
+                    self._note_member(gid, group_openid, SELF, mention.get("member_role"), failed=failed)
                 elif mentioned and not mention.get("bot"):
                     self.idmap.user_id(mentioned, mention.get("username"))
-                    self.idmap.touch_member(group_openid, mentioned, mention.get("member_role"), mention.get("member_nickname") or mention.get("username"))
-            uid = self.idmap.user_id(author.member_openid, author.username)
-            self.idmap.touch_member(group_openid, author.member_openid, author.member_role, card or author.username, seen=True)
+                    self._note_member(gid, group_openid, mentioned, mention.get("member_role"), mention.get("member_nickname") or mention.get("username"), failed=failed)
             at_me = isinstance(event, qe.GroupAtMessageCreateEvent) or any(getattr(m, "is_you", False) and getattr(m, "scope", "") == "single" for m in event.mentions or [])
             message = self._convert_message(event, at_me)
             if (quoted := self._quoted(event, GROUP, group_openid)) is not None:
@@ -563,12 +586,58 @@ class Bridge:
             if isinstance(event, qe.GroupAddRobotEvent):
                 self.idmap.set_group_active(event.group_openid, True)
                 self.idmap.note_group(event.group_openid, added_by=event.op_member_openid)
+                if event.op_member_openid:  # 拉机器人进群的人此刻一定在群里：记成成员，去掉更早的退群标记；身份不知道，不覆盖已有的
+                    self._present(event.group_openid, event.op_member_openid)
+                    self._note_member(gid, event.group_openid, event.op_member_openid, None, None, listed=True, at=self._timestamp(event.timestamp))
                 # 和成员添加机器人一样，这个事件也可以回复：进群时说的话因此不算主动消息，
                 # 而群主允许之前，群里是不许主动消息的。
                 joined = Inbound(GROUP, event.group_openid, event.event_id, time.time(), event=True) if getattr(event, "event_id", None) else None
                 return GroupIncreaseNoticeEvent(**common, notice_type="group_increase", sub_type="invite"), joined
-            self.idmap.forget_group(event.group_openid)  # 不在的群一律清掉，不留记录
+            self._forget_group(event.group_openid)  # 不在的群一律清掉，不留记录
             return GroupDecreaseNoticeEvent(**common, notice_type="group_decrease", sub_type="kick_me"), None
+
+        if isinstance(event, (qe.GroupMemberAddEvent, qe.GroupMemberRemoveEvent)):
+            # 群成员进群、退群（intent GROUP_MEMBER_EVENT）：只维护编号映射表里的成员和退群记录，不生成 OneBot 通知，
+            # 也不转给中继。日志只写群号。
+            removed = isinstance(event, qe.GroupMemberRemoveEvent)
+            # 先于任何写库。没写是谁的也记一笔：正在读的名单变了
+            self._present(event.group_openid, event.member_openid, left=removed, moved=True)
+            row = self.idmap.group_by_openid(event.group_openid)
+            if row is None:  # 不在记录里的群（比如机器人刚被移出、记录已清掉）：不为它新建记录
+                logger.info(f"official bridge: a member {'left' if removed else 'joined'} a group not on record")
+                return None
+            gid = row["gid"]
+            if not event.member_openid:
+                logger.info(f"official bridge: a member {'left' if removed else 'joined'} group {gid}, but the event names nobody")
+                return None
+            if removed:
+                left_at = self._timestamp(event.timestamp)
+                row = self.idmap.member(event.group_openid, event.member_openid)
+                if row is not None and left_at < (row["joined_at"] or 0) <= time.time():  # 迟到的退群：他在那之后又进过群
+                    # 读名单期间来的话，名单上有他也没写他（以事件为准），所以在这里撤掉早先那一笔
+                    self.idmap.clear_departed(event.group_openid, event.member_openid, left_at)
+                    logger.info(f"official bridge: a departure from group {gid} older than that member's joining: not noted")
+                    return None
+                user = self.idmap.user_by_openid(event.member_openid)
+                listed = row is not None or bool(
+                    user and user["linked"] and self.idmap.roster_member(gid, user["uid"]))  # 在不在该群的成员名单上（见过的，或名单表里认出的）
+                self.idmap.mark_departed(event.group_openid, event.member_openid, left_at)
+                logger.info(f"official bridge: a member left group {gid}" + ("" if listed else " (matched no one on its member list)"))
+            else:
+                joined_at = self._timestamp(event.timestamp)
+                back = self.idmap.clear_departed(event.group_openid, event.member_openid, after=joined_at, ties=True)
+                row = self.idmap.member(event.group_openid, event.member_openid)
+                # 进群早于记下的退群：什么都不写。否则记成成员（名字还不知道）；重新进群的只能是普通成员，原来记着的
+                # 管理员身份作废，但只在这次确实去掉了退群标记、或进群晚于他最后一次发言时（晚到的旧进群不改身份）
+                if not self.idmap.has_departed(event.group_openid, event.member_openid) and (row is None or back or joined_at > (row["last_seen"] or 0)):
+                    self.idmap.user_id(event.member_openid)
+                    self.idmap.touch_member(event.group_openid, event.member_openid, "member",
+                                            joined_at=max(joined_at, row["joined_at"] if row else 0))
+                elif row is not None and joined_at > (row["joined_at"] or 0) and not self.idmap.has_departed(event.group_openid, event.member_openid):
+                    # 他在那之后已经发过言：身份不动，进群时间照记，迟到的退群要和它比
+                    self.idmap.touch_member(event.group_openid, event.member_openid, None, joined_at=joined_at)
+                logger.info(f"official bridge: a member joined group {gid}" + (" (was on record as gone)" if back else ""))
+            return None
 
         if isinstance(event, qe.FriendAddEvent):
             uid = self.idmap.user_id(event.openid, friend=True)
@@ -581,6 +650,30 @@ class Bridge:
             self.idmap.unfriend(event.openid)
             return None
         return None
+
+    def _note_member(self, gid: int, *args: Any, failed: list[bool] | None = None, **kwargs: Any) -> bool:
+        """记下群里的一个成员（idmap.touch_member）。这只是记录：写库失败只记一行，这条消息照常处理。
+        `failed` 在一条消息里共用：失败过一次，后面的就不写了。"""
+        if failed is not None and failed[0]:
+            return False
+        try:
+            return self.idmap.touch_member(*args, **kwargs)
+        except sqlite3.Error as e:
+            if failed is not None:
+                failed[0] = True
+            logger.warning(f"official bridge: a member of group {gid} not written to the id map ({type(e).__name__}: {e})")
+            return False
+
+    def _present(self, group_openid: str, openid: str, left: bool = False, moved: bool = False) -> None:
+        """正在读这个群的平台成员名单时，此人发了言、进了群（读完时算他在名单上）或退了群。
+        这些人的身份、昵称和退群标记以事件为准：旧的一页里再出现，只算"在名单上"，不写他。
+        `moved`：是进群或退群（没写是谁时是空串），这一次读取因此不确认任何人退群。"""
+        for present, changed, moves in self._reading.get(group_openid, ()):
+            changed.add(openid)
+            if not left:
+                present.add(openid)
+            if moved:
+                moves.add(openid)
 
     def dispatch(self, ob_event: Any, inbound: Inbound | None) -> asyncio.Task:
         """为转换后的事件运行 OneBot 处理函数，并记下它的回复可以引用的内容。"""
@@ -1382,7 +1475,7 @@ class Bridge:
         return {
             "group_id": row["gid"],
             "group_name": row["name"] or f"群{row['gid']}",
-            "member_count": len(self._members_known(row["gid"], row["openid"])),
+            "member_count": self.idmap.count_known(row["openid"], row["gid"], self.self_id),
             "max_member_count": 0,
         }
 
@@ -1413,9 +1506,11 @@ class Bridge:
 
     def _member_info(self, gid: int, row: Any) -> dict:
         uid = self.idmap.user_id(row["openid"])
-        name = row["nickname"] or self._name_of(uid, None)
+        nickname = self._name_of(uid, None)
+        if uid >= USER_BASE and nickname == str(uid):
+            nickname = ""  # 名字还不知道（比如只收到过他的进群事件）：占位号不是 QQ 号，不拿它充当名字
         return {
-            "group_id": gid, "user_id": uid, "nickname": self._name_of(uid, None) if row["nickname"] else name, "card": row["nickname"] or "", "sex": "unknown", "age": 0, "area": "",
+            "group_id": gid, "user_id": uid, "nickname": nickname, "card": row["nickname"] or "", "sex": "unknown", "age": 0, "area": "",
             "join_time": int(row["joined_at"] or 0), "last_sent_time": int(row["last_seen"] or 0), "level": "0",
             "role": row["role"] or "member", "unfriendly": False, "title": "", "title_expire_time": 0, "card_changeable": False,
         }
@@ -1452,6 +1547,8 @@ class Bridge:
             return {"group_id": gid, "user_id": uid, "nickname": info["nickname"], "card": "", "role": role, "sex": "unknown", "age": 0, "join_time": 0, "last_sent_time": 0, "level": "0", "title": ""}
         group_openid = self._group(gid)
         openid = self.idmap.user_openid(uid)
+        if openid and self.idmap.has_departed(group_openid, openid):  # 平台说他已退群
+            raise ActionFailed(status="failed", retcode=1200, msg="member not found", wording="群成员不存在")
         row = self.idmap.member(group_openid, openid) if openid else None
         if row is None:
             kept = self.idmap.roster_member(gid, uid)
@@ -1460,40 +1557,252 @@ class Bridge:
             return self._roster_info(gid, kept)
         return self._member_info(gid, row)
 
-    async def _refresh_members(self, group_openid: str) -> int:
-        """从平台读取成员名单存进编号映射表；返回列出的成员数。
+    async def _refresh_members(self, group_openid: str) -> bool:
+        """从平台读取成员名单存进编号映射表；返回是否完整读完。
 
         GET /v2/groups/{group_openid}/members，每页 30 个。这个权限是逐个机器人单独开通的（未开通时
-        返回 11253），所以调用方会退而使用见过发言的成员。
+        返回 11253），所以调用方用的一直是见过的成员；这里读到的只是补充。平时由 _member_task 安排。
+        不删任何成员行：某人退了 A 群、在 B 群潜水没被见过，A 读成功删了他、B 这次又读失败，他就成了不在任何群。
+        隔开的两次完整读取都没有、第二次还核对得上的人，才记成已退群（见 _read_members）。这个标记影响普通名单、成员信息和
+        present_numbers / last_present（周检据此判断谁可能已经离开）；no_cache 名单和人数不看它。
         """
-        url = self.qq.adapter.get_api_base().joinpath("v2", "groups", group_openid, "members")
+        async with self._members_lock:  # 一次只读一个群：频率限制是整个机器人共用的
+            return await self._read_members(group_openid)
+
+    async def _paced(self, url: Any, params: dict | None = None) -> Any:
+        """读成员名单的一次请求。全机器人共用一个节奏：任意两次之间至少隔 MEMBER_PAGE_PACE 秒（不分哪个群，
+        失败了也算一次）。平台说太频繁（429）时，之后 MEMBERS_BACKOFF 秒谁都不发，连续再遇到就翻倍，
+        最多 MEMBERS_BACKOFF_MAX 秒；成功一次就恢复。"""
+        wait = self._members_next_at - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            answer = await self.qq._request(Request("GET", url, params=params) if params is not None else Request("GET", url))
+        except QQActionFailed as e:
+            if isinstance(e, QQRateLimited) or getattr(e, "status_code", None) == 429:
+                self._members_backoff = min(MEMBERS_BACKOFF_MAX, self._members_backoff * 2 or MEMBERS_BACKOFF)
+                self._members_next_at = time.monotonic() + self._members_backoff
+                logger.info(f"official bridge: member lists are read too often for the platform: pausing for {int(self._members_backoff)} s")
+            else:
+                self._members_next_at = time.monotonic() + MEMBER_PAGE_PACE
+            raise
+        except BaseException:
+            self._members_next_at = time.monotonic() + MEMBER_PAGE_PACE
+            raise
+        self._members_backoff = 0.0
+        self._members_next_at = time.monotonic() + MEMBER_PAGE_PACE
+        return answer
+
+    async def _read_members(self, group_openid: str) -> bool:
+        """_refresh_members 的本体，调用方已拿着 _members_lock。返回是否完整读完。
+
+        开读时间和"读的过程中出现过的人"都从真正开读算起（拿到锁之后）。
+        next_cursor 是空串才算读到头（文档："空串表示已到末页"）。下面任一情况都算没读完，谁也不记：
+        一页不是 dict，members 不是列表，next_cursor 不是字符串，或者带着非 0 的 code；一页是空的却还有下一页；
+        members 里有不是对象、或没有 member_openid 的项；cursor 回到读过的一页（含 A-B-A）；到了 MEMBER_PAGES 页还没完；
+        名单里一个真人都没有。
+        读完了，名单上没有也不一定就是退了群（名单一边读一边在变，平台也会答错），所以第一次只记一笔、照样算在场。
+        下一次读完（_member_task 保证隔着 MEMBERS_REFRESH_EVERY 以上）还没有他、中间也没露过面，并且这一次下面几样都成立，
+        才记成退群：读的过程中没人进群、退群；读前、读后各问一次的群人数一样，而且正好是名单里不重复的人和机器人的个数；
+        名单上见到过在那个群发过言的人（编号是同一套，见过一次即可）。人数和名单各算不算机器人、算不算本机器人，没有实物可查：
+        只认相等，差一个也不确认（错的方向是晚确认）；开通以后按日志里那行的几个数再调。
+        每一页回来先确认机器人还在这个群里：读的过程中被移出的群，不能再往记录里写。
+        """
+        row = self.idmap.group_by_openid(group_openid)
+        if row is None:
+            return False
+        gid = row["gid"]
+        base = self.qq.adapter.get_api_base().joinpath("v2", "groups", group_openid)
         listed: set[str] = set()
-        cursor = ""
-        for _page in range(400):
-            page = await self.qq._request(Request("GET", url, params={"cursor": cursor}))
-            for member in (page or {}).get("members") or []:
-                openid = member.get("member_openid")
-                if not openid:
-                    continue
-                listed.add(openid)
-                if member.get("bot"):
-                    continue
+        humans: set[str] = set()
+        present: set[str] = set()  # 读的过程中在这个群发言、进群的人：他那一页可能在他进群之前就读过了
+        changed: set[str] = set()  # 读的过程中发言、进群、退群的人：以事件为准，旧的一页里再出现不写他
+        moved: set[str] = set()  # 读的过程中进群、退群的人（没写是谁的是空串）：有的话这一次谁也不确认退群
+        waiting: set[str] = set()  # 早先一次就不在名单上、这次又没有的人
+        counted = recounted = None  # 有人可能要记成退群时，读之前、读之后各问一次群人数
+        entry = (present, changed, moved)
+        self._reading.setdefault(group_openid, []).append(entry)
+        started = int(time.time())  # 取整到秒：平台事件的时间是整秒，同一秒里收到的退群不算在开读之前
+        complete = False
+        try:
+            known = self.idmap.known_in(group_openid, gid)  # 只有开读之前就在记录里的人，才可能因为名单上没有而记成退群
+            doubted = self.idmap.unlisted_in(group_openid) & known
+            if doubted:
+                counted = await self._member_count(group_openid, gid)
+            cursor, seen = "", {""}
+            for _ in range(MEMBER_PAGES):
+                page = await self._paced(base.joinpath("members"), {"cursor": cursor})
+                still = self.idmap.group_by_openid(group_openid)
+                if still is None or still["gid"] != gid:
+                    logger.info(f"official bridge: the bot left group {gid} while reading its member list: reading stopped")
+                    return False
+                if (not isinstance(page, dict) or not isinstance(page.get("members"), list) or not isinstance(page.get("next_cursor"), str)
+                        or page.get("code") not in (None, 0) or (page["next_cursor"] and not page["members"])):
+                    logger.info(f"official bridge: the member list of group {gid} stopped at an answer that is not a page: nobody noted as gone")
+                    return False
+                if any(not isinstance(member, dict) or not member.get("member_openid") for member in page["members"]):
+                    logger.info(f"official bridge: the member list of group {gid} has an entry that is not a member: nobody noted as gone")
+                    return False
+                with self.idmap.transaction():  # 一页一次写盘：人多的群第一次读时，不必每人等一次硬盘
+                    for member in page["members"]:
+                        openid = member["member_openid"]
+                        listed.add(openid)
+                        if member.get("bot"):
+                            self.idmap.clear_departed(group_openid, openid, started)  # 别的机器人也会在记录里：列出来就是还在
+                            continue
+                        humans.add(openid)
+                        if openid in changed:
+                            continue
+                        try:
+                            joined = datetime.fromisoformat(str(member.get("joined_at"))).timestamp()
+                        except ValueError:
+                            joined = 0
+                        self.idmap.user_id(openid, member.get("username"))
+                        # 只去掉开读之前记下的退群标记：读的过程中才退群的人，旧的一页里还会有他
+                        self.idmap.touch_member(group_openid, openid, member.get("member_role"), None, joined, listed=True, at=started)
+                cursor = page["next_cursor"]
+                if not cursor:
+                    complete = True
+                    break
+                if cursor in seen:
+                    logger.info(f"official bridge: the member list of group {gid} came back to a page already read: nobody noted as gone")
+                    return False
+                seen.add(cursor)
+            if complete and humans:
+                waiting = doubted - listed - present
+                if waiting and counted and not moved:
+                    recounted = await self._member_count(group_openid, gid)  # 还算在读：这期间的事件照样记着
+        finally:
+            readers = [r for r in self._reading.get(group_openid, []) if r is not entry]
+            if readers:
+                self._reading[group_openid] = readers
+            else:
+                self._reading.pop(group_openid, None)
+        if not complete:
+            logger.info(f"official bridge: the member list of group {gid} has more than {MEMBER_PAGES} pages: nobody noted as gone")
+            return False
+        if not humans:
+            logger.info(f"official bridge: the member list of group {gid} names nobody but bots: nobody noted as gone")
+            return False
+        still = self.idmap.group_by_openid(group_openid)
+        if still is None or still["gid"] != gid:
+            return False
+        self.idmap.set_meta(f"members_read:{group_openid}", str(time.time()))
+        same_ids = self.idmap.meta(MEMBER_IDS_SEEN) is not None
+        # 只认名单上发过言的人：只在名单上见过的证明不了什么，答错的名单也会把他们写进来
+        if not same_ids and any(row["last_seen"] and row["openid"] in humans for row in self.idmap.members(group_openid)):
+            self.idmap.set_meta(MEMBER_IDS_SEEN, "1")
+            same_ids = True
+        waiting -= present
+        if waiting:
+            if moved or not same_ids or not counted or recounted != counted or counted != len(listed):
+                logger.info(f"official bridge: the member list of group {gid} does not prove anyone gone ({len(listed)} entries, {len(humans)} of them people, count {counted} then {recounted}, "
+                            f"{len(moved)} came or went meanwhile, ids seen speaking: {same_ids})")
+                waiting = set()  # 这次不确认；新缺席的照样记下第一次，早先记下的时间不动
+        noted = self.idmap.mark_absent(group_openid, gid, listed | present, started, known, waiting)
+        if noted:
+            logger.info(f"official bridge: the member list of group {gid} was read in full: {noted} members on record are not on it, noted as gone")
+        return True
+
+    async def _member_count(self, group_openid: str, gid: int) -> int | None:
+        """平台现在说这个群有多少人（核对名单用）；问不到时为 None。"""
+        try:
+            return int((await self.group_info(group_openid) or {}).get("group_member_num") or 0) or None
+        except Exception as e:
+            logger.info(f"official bridge: the member count of group {gid} not read ({type(e).__name__})")
+            return None
+
+    def _list_read_at(self, group_openid: str) -> float:
+        """上次完整读完这个群的平台名单是什么时候（存在表里，重启不丢）；没读完过时为 0。"""
+        return float(self.idmap.meta(f"members_read:{group_openid}") or 0)
+
+    async def read_due_lists(self) -> int:
+        """把该读的活跃群的平台名单读一轮（__init__ 每小时叫一次），返回读完了几个群。
+
+        present_numbers 只看表：只潜水的人要靠名单才会被记成在场，漏了退群事件的人也要靠它才会被记成退群。
+        一次只排一个群，别人现要的名单插得进来。最久没读的先读；上次没读成的（报错、没读完、没权限）6 小时内不再试，
+        而且排在读成过的后面：一个总是失败的群挡不住别的群，重启也一样。没权限的那几个小时里不查表、不发请求。
+        """
+        now = time.time()
+        if now < self._members_denied_until:
+            return 0
+        due = []
+        for row in self.idmap.groups():
+            openid = row["openid"]
+            read, tried = self._list_read_at(openid), float(self.idmap.meta(f"members_tried:{openid}") or 0)
+            if now - read >= MEMBERS_DAILY_AFTER and now - tried >= MEMBERS_REFRESH_EVERY:
+                due.append((tried > read, max(read, tried), openid))
+        done = 0
+        for *_, openid in sorted(due):
+            if (task := self._member_task(openid)) is not None and await asyncio.shield(task):
+                done += 1
+        if done:
+            logger.info(f"official bridge: member lists read in full: {done} of {len(due)} groups that were due")
+        return done
+
+    def _member_task(self, group_openid: str) -> asyncio.Task | None:
+        """这个群正在排队或在读的那一次成员名单读取；到期了就排上一次，在后台跑。每群最多一个。
+        没开权限时（11253）6 小时内哪个群都不排。从上次排上、上次读完（存在表里）两者里晚的算起，MEMBERS_REFRESH_EVERY
+        秒内不再读：两次"名单上没有他"因此总隔着这么久，重启也一样。读失败或没读完的 MEMBERS_RETRY_AFTER 秒后可以再排。"""
+        task = self._member_tasks.get(group_openid)
+        if task is not None and not task.done():
+            return task
+        now = time.time()
+        if now < self._members_denied_until:
+            return None
+        if now - max(self._members_read_at.get(group_openid, 0), self._list_read_at(group_openid)) < MEMBERS_REFRESH_EVERY:
+            return None
+        self._members_read_at[group_openid] = now
+        task = asyncio.create_task(self._refresh_quietly(group_openid))
+        self._member_tasks[group_openid] = task
+        task.add_done_callback(lambda done, key=group_openid: self._member_tasks.pop(key, None) if self._member_tasks.get(key) is done else None)
+        return task
+
+    async def _refresh_quietly(self, group_openid: str) -> bool:
+        """排上的那一次：拿到锁之后再看一次有没有权限（排队期间别的群可能已经问出没有）。失败只记一行。"""
+        try:
+            async with self._members_lock:
+                if time.time() < self._members_denied_until:
+                    return False
+                complete = await self._read_members(group_openid)
+        except Exception as e:
+            if getattr(e, "code", None) == MEMBERS_NOT_GRANTED:
+                self._members_denied_until = time.time() + 6 * 3600
+            else:
+                self._members_read_at[group_openid] = time.time() - MEMBERS_REFRESH_EVERY + MEMBERS_RETRY_AFTER
+            code = getattr(e, "code", None) or type(e).__name__
+            if code == MEMBERS_NOT_GRANTED:
+                logger.debug(f"official bridge: member list not refreshed ({code}), using members seen so far")
+            else:
                 try:
-                    joined = datetime.fromisoformat(str(member.get("joined_at"))).timestamp()
-                except ValueError:
-                    joined = 0
-                self.idmap.user_id(openid, member.get("username"))
-                self.idmap.touch_member(group_openid, openid, member.get("member_role"), None, joined)
-            cursor = (page or {}).get("next_cursor") or ""
-            if not cursor:
-                break
-        if listed:
-            self.idmap.drop_members(group_openid, listed)
-        return len(listed)
+                    row = self.idmap.group_by_openid(group_openid)
+                except sqlite3.Error:  # 查不了群号，也得把这一次了结
+                    row = None
+                logger.info(f"official bridge: the member list of group {row['gid'] if row else '?'} not read ({code}), using members seen so far")
+            self._note_not_read(group_openid)
+            return False
+        if not complete:
+            self._members_read_at[group_openid] = time.time() - MEMBERS_REFRESH_EVERY + MEMBERS_RETRY_AFTER
+            self._note_not_read(group_openid)
+        return complete
+
+    def _note_not_read(self, group_openid: str) -> None:
+        """记下这个群这次没读成（重启不丢）：每小时那一轮 6 小时内不再试它。"""
+        try:
+            if self.idmap.group_by_openid(group_openid) is not None:  # 已经不在的群不留记录
+                self.idmap.set_meta(f"members_tried:{group_openid}", str(time.time()))
+        except sqlite3.Error as e:
+            logger.warning(f"official bridge: a failed member list read not written to the id map ({type(e).__name__})")
 
     async def group_info(self, group_openid: str) -> dict | None:
-        """GET /v2/groups/{group_openid}/info：群名、人数等（没有群号）。群已解散或机器人已不在群里时返回 None。"""
+        """GET /v2/groups/{group_openid}/info：群名、人数等（没有群号）。群已解散或机器人已不在群里时返回 None。
+        全机器人共用一个节奏：两次之间至少隔 GROUP_INFO_PACE 秒。"""
         url = self.qq.adapter.get_api_base().joinpath("v2", "groups", group_openid, "info")
+        now = time.monotonic()
+        wait = self._info_next_at - now
+        self._info_next_at = max(now, self._info_next_at) + GROUP_INFO_PACE  # 先占下这一格：同时来问的各等各的
+        if wait > 0:
+            await asyncio.sleep(wait)
         try:
             return await self.qq._request(Request("GET", url)) or {}
         except QQActionFailed as e:
@@ -1502,19 +1811,35 @@ class Bridge:
             raise
 
     async def check_group(self, openid: str) -> str:
-        """取一个群的群名记下来，返回 "named"。平台说群不存在（已解散，或机器人已不在群里）时，
-        和被移出一样清掉这个群并告诉各插件，返回 "gone"。查询失败时抛出异常。"""
+        """取一个群的群名记下来，返回 "named"。平台说群不存在（已解散，或机器人已不在群里）时，第一次只记下时间、
+        返回 "doubtful"；至少隔 GROUP_GONE_CONFIRM 秒的一次检查又这么说，才和被移出一样清掉这个群并告诉各插件，
+        返回 "gone"。平台答错一次，就会让只在这个群被见过的人全部失去在场的证据。查询失败时抛出异常。"""
+        key = f"group_gone_once:{openid}"
         info = await self.group_info(openid)
         if info is None:
-            self.leave_group(openid)
-            return "gone"
+            first = float(self.idmap.meta(key) or 0)
+            if first and time.time() - first >= GROUP_GONE_CONFIRM:
+                self.leave_group(openid)  # forget_group 一并清掉这条记录
+                return "gone"
+            if not first:
+                self.idmap.set_meta(key, str(time.time()))
+            row = self.idmap.group_by_openid(openid)
+            logger.info(f"official bridge: group {row['gid'] if row else '?'} was said not to exist; it is cleared only if a later check says so again")
+            return "doubtful"
+        if self.idmap.meta(key) is not None:
+            self.idmap.drop_meta(key)
         if name := str(info.get("group_name") or "").strip():
             self.idmap.note_group(openid, name=name)
         return "named"
 
+    def _forget_group(self, openid: str) -> int | None:
+        """清掉一个机器人已不在的群，连同内存里"刚读过它的名单"：它再出现时，下一轮就读。"""
+        self._members_read_at.pop(openid, None)
+        return self.idmap.forget_group(openid)
+
     def leave_group(self, openid: str) -> None:
         """机器人已不在这个群：删掉它的记录，并像被移出时一样告诉各插件（它们各自清掉该群的数据）。"""
-        gid = self.idmap.forget_group(openid)
+        gid = self._forget_group(openid)
         if gid is None:
             return
         logger.info(f"official bridge: group {gid} is gone: its records were removed")
@@ -1545,7 +1870,7 @@ class Bridge:
         gid = int(group_id)
         group_openid = self._group(gid)
         if no_cache and not self.members_authoritative:
-            # 调用方要一份最新的完整名单，是拿它当谁已退群的证据（森空岛体检据此解绑）。原机器人在的群，
+            # 调用方要一份最新的完整名单，是拿它当谁已退群的证据（周检现在不读它，改问 present_numbers）。原机器人在的群，
             # 由原机器人给出名单（调用不会到这里）。其他情况以本机器人自己的记录为准：
             # 只有它待过的群，用它见过的成员；原机器人已离开的群，用这些成员加上原机器人离开那天保存的最后
             # 一份完整名单。其他情况不回答：带着原群号却没有这样一份最终名单的群（原机器人只是离线，或留过
@@ -1571,16 +1896,26 @@ class Bridge:
                     raise refused from None
                 if theirs or not self.old_bot_gone_at():
                     raise refused
-        try:
-            if time.time() >= self._members_denied_until:
-                await self._refresh_members(group_openid)
-        except Exception as e:
-            if getattr(e, "code", None) == MEMBERS_NOT_GRANTED:
-                self._members_denied_until = time.time() + 6 * 3600
-            logger.debug(f"official bridge: member list not refreshed ({getattr(e, 'code', type(e).__name__)}), using members seen so far")
+        task = self._member_task(group_openid)  # 平台成员名单（开了权限才有）在后台读
+        complete = False
+        if no_cache and task is not None:
+            # 要最新完整名单的调用方等这个群在排或在读的那一次：读到的人会补进记录。等的人被取消也不打断它；
+            # 读失败就照旧用已经记下的。普通名单不等，这次用已经记下的。
+            try:
+                complete = await asyncio.shield(task)
+            except Exception:
+                complete = False
+        if no_cache and self.members_authoritative and not (complete or time.time() - self._list_read_at(group_openid) < MEMBERS_REFRESH_EVERY):
+            # 把名单当作权威的部署：最近没有一次完整读完这个群，就不回答（见过的人不等于群里的人）
+            raise ActionFailed(status="failed", retcode=1403, msg="member list not read in full lately", wording="官方机器人的成员列表不完整")
         if no_cache and gid >= GROUP_BASE:
             return [self._member_info(gid, row) for row in self.idmap.members(group_openid)]
-        return self._members_known(gid, group_openid)
+        if no_cache:
+            return self._members_known(gid, group_openid)
+        # 平台说已退群的人不再列出（榜单的“本群”、谁能上榜都按这份名单）。要最新完整名单的（no_cache）和群人数
+        # 照旧算他们，两者口径一致。
+        gone = self.idmap.departed_uids(group_openid)
+        return [member for member in self._members_known(gid, group_openid) if member["user_id"] not in gone]
 
     async def _upload_file(self, kind: str, openid: str, file: Any, name: str | None) -> None:
         blob, url = self._read_file(file)

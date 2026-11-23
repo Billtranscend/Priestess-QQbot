@@ -9,10 +9,10 @@
      （例如“当前用户未经授权”）会被移除；
   4. 只要还有任何一个角色能用，账号本身就保留：只有登录失效，或者它所有真实角色都被拒绝时
      才解绑；
-  0. 既不在机器人任何一个群里、也不是机器人好友的成员，在为他发出任何森空岛请求之前，连同所有
-     账号一起解绑（他们用不了机器人，每晚的任务却还在为他们跑；只在私聊里用机器人的好友保留）。
-     前提是每个群的成员列表和好友列表都完整读到了（好友列表是空的也算没读到），有官方机器人时还要查清
-     谁在等重新绑定（见 0b）；超级用户保留；
+  0. 疑似已离开的成员（不在机器人任何一个群里，也不是机器人好友，见 plugins/skland_away.py）先停掉为他们
+     跑的定时任务；连续 AWAY_DAYS 天都是这样，在为他发出任何森空岛请求之前连同所有账号一起解绑，删之前再查
+     一次。还没到期的只查登录（过期的照样解绑），不同步、不探测角色。查不清谁离开、或查不清谁在等重新绑定
+     （见 0b）时，这次谁都不按离开解绑；超级用户保留；
   0b. 官方 QQ 机器人接替了 OneBot 账号的地方（plugins/official_bridge）：通过旧账号绑定、官方机器人
      从未认出的成员，从旧账号不在任何群里那天起，不参加每晚签到，也不参加这里的任何检查，
      保留 45 天后解绑（见 dormant.py）。回来要靠他们自己：在私聊里扫码登录
@@ -81,11 +81,12 @@ from sqlalchemy.exc import DBAPIError
 
 from . import backup
 from .dormant import KEEP_DAYS, days_left, overdue, waiting_owners
-from plugins.shared import first_bot, tell_superusers, write_json
+from plugins.shared import tell_superusers, write_json
+from plugins.skland_away import AWAY_DAYS, away_owners, paused_owners, still_away
 
 __plugin_meta__ = PluginMetadata(
     name="Skland health check",
-    description="每周一 04:00 清理失效的森空岛绑定（含已退出机器人所有群的成员），并为签到增加网络重试。",
+    description="每周一 04:00 清理失效的森空岛绑定（含离开机器人所有群、也不是好友满 45 天的成员），并为签到增加网络重试。",
     usage="/森空岛体检 [清理]（超级用户）",
     type="application",
 )
@@ -351,55 +352,6 @@ def _drop_queue(user_ids: list[int]) -> None:
 # ── 体检本身 ───────────────────────────────────────────────────────────
 
 
-MEMBER_LIST_TRIES = 3
-MEMBER_LIST_PAUSE = 5  # 秒
-
-
-async def absent_owners(session) -> set[int] | None:
-    """有森空岛账号、但 QQ 既不在机器人任何一个群里、也不是机器人好友的所有者（bind id）。
-
-    只在私聊里用机器人的好友不算离开。判断不了时为 None：没有机器人、
-    没有群，某个成员列表读回来少了人，或者好友列表读不到或是空的（名单读错，绝不能因此解绑任何人）。
-    """
-    bot = first_bot()
-    if bot is None:
-        return None
-    try:
-        groups = await bot.get_group_list(no_cache=True)
-        members: set[str] = set()
-        for group in groups:
-            gid, expected, listed = group["group_id"], group.get("member_count") or 0, []
-            # 大群的人数和成员列表是先后读的：中间有人进群或退群，列表就少一个，整个步骤
-            # 就会被跳过。放弃之前再问一次，人数也重新问。
-            for _attempt in range(MEMBER_LIST_TRIES):
-                listed = await bot.get_group_member_list(group_id=gid, no_cache=True)
-                if listed and len(listed) >= expected:
-                    break
-                await asyncio.sleep(MEMBER_LIST_PAUSE)
-                with contextlib.suppress(Exception):
-                    expected = (await bot.get_group_info(group_id=gid, no_cache=True)).get("member_count") or expected
-            else:
-                logger.info(f"Skland health check: member list of group {gid} short ({len(listed or [])}/{expected}) after {MEMBER_LIST_TRIES} tries, nobody unbound for leaving")
-                return None
-            members |= {str(member["user_id"]) for member in listed}
-            await asyncio.sleep(0.5)
-        friends = await bot.get_friend_list(no_cache=True)
-        if not friends:  # 机器人总有好友（至少是管理它的人）：空列表是没读到，不是真的没有
-            logger.info("Skland health check: the friend list came back empty, nobody unbound for leaving")
-            return None
-        members |= {str(friend["user_id"]) for friend in friends}
-    except Exception as e:
-        logger.info(f"Skland health check: group members or friends not read ({type(e).__name__}), nobody unbound for leaving")
-        return None
-    if not groups:
-        return None
-    superusers = {str(user) for user in get_driver().config.superusers}
-    rows = (await session.execute(select(Bind.platform_id, Bind.bind_id).where(Bind.bind_id.in_(select(SkUser.owner_id))))).all()
-    present = {bind_id for platform_id, bind_id in rows if platform_id in members or platform_id in superusers}
-    return {bind_id for _, bind_id in rows} - present
-
-
-
 async def members_waiting(session) -> tuple[set[int] | None, float | None]:
     """通过旧机器人绑定、官方机器人从未认出的所有者，以及他们从什么时候开始等待。
 
@@ -422,7 +374,7 @@ async def members_waiting(session) -> tuple[set[int] | None, float | None]:
         return None, None
 
 
-async def _check_account(account_id: int, session, apply: bool, absent: set[int] | None, waiting: set[int], time_is_up: bool,
+async def _check_account(account_id: int, session, apply: bool, away: dict[int, float], waiting: set[int], time_is_up: bool,
                          stats: Counter, reasons: Counter, export: Counter, touched: set[int]) -> None:
     """检查一个账号（run 的一个 worker 调用）；session 只给这一个账号用，不自动 flush、提交后不过期（见 run）。export 见 _checkpoint。
 
@@ -453,8 +405,9 @@ async def _check_account(account_id: int, session, apply: bool, absent: set[int]
         else:
             stats["waiting_accounts"] += 1
         return
-    if absent and owner_id in absent:
-        await remove("left_accounts", "账号：本人已不在机器人所在的任何群，也不是机器人好友")
+    since = away.get(owner_id)
+    if since is not None and overdue(since, time.time(), AWAY_DAYS) and await still_away(session, owner_id, since):
+        await remove("left_accounts", f"账号：连续 {AWAY_DAYS} 天不在机器人所在的任何群，也不是机器人好友")
         return
     try:
         state, _ = await _login(user)
@@ -469,6 +422,8 @@ async def _check_account(account_id: int, session, apply: bool, absent: set[int]
             stats["unclear_accounts"] += 1
             reasons[f"账号：{state}（未处理，下次再查）"] += 1
             return
+        if since is not None:
+            return  # 疑似已离开：只查登录，别的森空岛请求都不为他发
         if apply:
             synced = await sync_account(account_id, session)
             if not synced.success:
@@ -542,15 +497,17 @@ async def _check_all(apply: bool) -> dict:
     started = time.time()
     session = get_scoped_session()
     try:
-        absent = await absent_owners(session)
-        if absent is None:
+        away = await away_owners(session)
+        if away is None:
             stats["groups_unchecked"] = 1
         waiting, gone_at = await members_waiting(session)
         if waiting is None:
             # 有官方机器人，却查不清谁在等：等的人多半也不在任何群里，这次谁都不按“已退群”解绑
-            waiting, absent = set(), None
+            waiting, away = set(), None
             stats["waiting_unknown"] = 1
         time_is_up = overdue(gone_at, time.time())
+        now = time.time()
+        away = away or {}
         if waiting:
             stats["waiting_days_left"] = days_left(gone_at, time.time()) or 0
         account_ids = list((await session.scalars(select(SkUser.id))).all())
@@ -564,7 +521,7 @@ async def _check_all(apply: bool) -> dict:
                 try:
                     # 不自动 flush、提交后不过期：什么时候写由 _check_account 决定，提交后手里的账号和角色照样能读
                     async with get_session(autoflush=False, expire_on_commit=False) as own:
-                        await _check_account(account_id, own, apply, absent, waiting, time_is_up, stats, reasons, export, touched)
+                        await _check_account(account_id, own, apply, away, waiting, time_is_up, stats, reasons, export, touched)
                 except Exception as e:  # 一个账号出错不能停掉其他 worker；这个账号这次不动
                     stats["errors"] += 1
                     logger.warning(f"Skland health check: account skipped after {_why(e)}")
@@ -577,10 +534,14 @@ async def _check_all(apply: bool) -> dict:
                 removed_owners = sorted(touched - left)
                 stats["defaults_set"] = await ensure_defaults(session, sorted(touched))
                 await session.commit()
+                await away_owners(session)  # 已解绑的人不再计时：恢复或重新绑定的从头算
             except Exception as e:  # 删掉的都已提交，报告更要紧：默认角色下次启动时会再补
                 await session.rollback()
                 stats["defaults_unchecked"] = 1
                 logger.warning(f"Skland health check: default roles not checked after the removals ({_why(e)})")
+        pending = [since for owner, since in away.items() if owner not in removed_owners and not overdue(since, now, AWAY_DAYS)]
+        if pending:  # 这次已经解绑干净的人不再报成停着任务
+            stats["away_members"], stats["away_days_left"] = len(pending), days_left(min(pending), now, AWAY_DAYS)
     finally:
         await session.close()
         if apply:
@@ -616,9 +577,11 @@ def summary(result: dict) -> str:
     if skipped:
         lines.append(f"因网络、接口报错或异常跳过 {skipped} 个账号（未改动，下次再查）")
     if result.get("groups_unchecked"):
-        lines.append("群成员名单或好友列表没能完整读取：本次没有按「已退群」解除任何账号")
+        lines.append("没能查清谁还在群里或是好友：本次没有按「已退群」解除任何账号")
     if result.get("waiting_unknown"):
         lines.append("没能查清哪些成员还在等机器人更换后重新绑定：本次没有按「已退群」解除任何账号，这些成员的账号照常检查")
+    if result.get("away_members"):
+        lines.append(f"疑似已离开（不在任何群、也不是好友）{result['away_members']} 人：已停定时任务，最早 {result['away_days_left']} 天后解除，期间露面就恢复")
     if result.get("waiting_accounts"):
         lines.append(f"机器人更换后还没重新绑定的老账号 {result['waiting_accounts']} 个：已停自动签到、未检查，{result.get('waiting_days_left', 0)} 天后解除")
     if result["apply"] and result["backup"]:
@@ -637,7 +600,7 @@ async def _weekly() -> None:
     result = await run(apply=True)
     # errors 也要说：备份写不成时要删的都只记在这里
     if not any(result.get(key) for key in ("invalid_accounts", "empty_accounts", "left_accounts", "invalid_roles", "network_skipped", "errors",
-                                           "groups_unchecked", "waiting_unknown", "waiting_removed", "backup_unverified", "defaults_unchecked")):
+                                           "groups_unchecked", "waiting_unknown", "waiting_removed", "backup_unverified", "defaults_unchecked", "away_members")):
         return
     await tell_superusers(summary(result), "Skland health check")
 
@@ -756,6 +719,7 @@ async def _save_tokens(session) -> None:
 
 async def run_daily_sign(game) -> None:
     """一个游戏的每晚签到（/全体签到 也用它）：WORKERS 个账号同时签，每个账号用自己的会话，处理完就保存。
+    等待重新绑定的、疑似已离开的成员不签。
 
     插件在 scoped session 上运行两个任务，而在指令之外，这个会话是整个进程共用的同一个：
     先跑完的任务会在另一个任务还在用时把它关掉，后者因 DetachedInstanceError 而死，当天剩下的
@@ -765,9 +729,11 @@ async def run_daily_sign(game) -> None:
     """
     async with get_session() as session:
         waiting = (await members_waiting(session))[0] or set()  # 查不清谁在等时照常全部签：多签几个人无害
+        away = await paused_owners(session)
         accounts = [(account.id, account.owner_id) for account in await select_all_accounts(session)]
     left_out = sum(1 for _, owner_id in accounts if owner_id in waiting)  # 通过旧机器人绑定、之后一直没出现：在他们回来之前不签到
-    todo = [account_id for account_id, owner_id in accounts if owner_id not in waiting]
+    paused = sum(1 for _, owner_id in accounts if owner_id in away and owner_id not in waiting)
+    todo = [account_id for account_id, owner_id in accounts if owner_id not in waiting and owner_id not in away]
     signed: list[list] = [[] for _ in todo]
     broken = [0]
     queue: asyncio.Queue[int] = asyncio.Queue()
@@ -782,7 +748,7 @@ async def run_daily_sign(game) -> None:
     await asyncio.gather(*(worker() for _ in range(min(WORKERS, len(todo)) or 1)))
     entries = [entry for account in signed for entry in account]
     sign_service.write_sign_cache(game, entries)
-    logger.info(f"Nightly sign-in ({game}): {len(entries)} roles done" + (f", {broken[0]} ended with an error" if broken[0] else "") + (f"; {left_out} account(s) of members not recognised since the official bot took over left out" if left_out else ""))
+    logger.info(f"Nightly sign-in ({game}): {len(entries)} roles done" + (f", {broken[0]} ended with an error" if broken[0] else "") + (f"; {left_out} account(s) of members not recognised since the official bot took over left out" if left_out else "") + (f"; {paused} account(s) of members who seem to have left paused" if paused else ""))
 
 
 async def _sign_account(account_id: int, game, broken: list[int]) -> list:

@@ -1,7 +1,7 @@
 """绑定后以及每天（Asia/Shanghai 时区）在后台更新终末地抽卡记录。
 
 队列以成员（nonebot-plugin-user 的 id，即 `SkUser.owner_id`）为键。一项任务同步该成员绑定的
-每个森空岛账号下的每个终末地角色。
+每个森空岛账号下的每个终末地角色。登录已过期的成员不重试，之后每周只再试一次，重新扫码即恢复。
 """
 from __future__ import annotations
 
@@ -31,20 +31,17 @@ from nonebot_plugin_skland.services import binding
 from nonebot_plugin_skland.services.gacha import get_all_ef_gacha_records
 
 
-from .core import Queue, TZ, record_values
+from plugins.skland_away import paused_owners
+
+from .core import Queue, TZ, login_expired, record_values, weekly_turn
 
 # 抽卡记录 API 每页 5 行，最新的在前。每晚把每个成员的全部记录读一遍，成员多时
 # 要十万次以上请求、8 小时以上，而新增的抽卡只有几百次。所以每个卡池从最新一页
 # 往回读，读到第一条已存的记录为止。一个角色的记录在所有卡池都读完后一次性保存，所以存下的
 # 始终是从最新往旧、连续完整的一段。
-# 兜底：每个成员每周有一天（owner_id % 7）完整读一遍，读到的超出最新那一段的记录记为 `missed`。
-FULL_CHECK_DAYS = 7
+# 兜底：每个成员每周有一天（weekly_turn）完整读一遍，读到的超出最新那一段的记录记为 `missed`。
 WORKERS = 5  # 同时同步的成员数，与竞速榜采集相同
 REQUEST_GAP = 2  # 同一个 worker 两个成员之间的秒数
-
-
-def full_check_due(owner_id: int, today) -> bool:
-    return owner_id % FULL_CHECK_DAYS == today.toordinal() % FULL_CHECK_DAYS
 
 
 def newest_stretch(records, known: set) -> list:
@@ -115,8 +112,8 @@ verify_upstream()
 async def sync_user(owner_id: int) -> tuple[str, int]:
     """同步成员的每个终末地角色：返回（"success" | "partial" | 原因，新增行数）。
 
-    "partial"：部分角色已同步，至少一个失败。所有角色都失败时，抛出第一个错误，
-    让队列重试。
+    "partial"：部分角色已同步，至少一个失败。所有角色都失败时抛出错误，交给队列处理：
+    有不是登录过期的就抛那一个（会重试），全是登录过期才抛登录过期。
     """
     # 在短会话里读取凭据；HTTP 请求期间不持有事务。
     async with get_session() as session:
@@ -135,7 +132,7 @@ async def sync_user(owner_id: int) -> tuple[str, int]:
     known_by_role: dict[int, set] = {}
     for character_id, gacha_ts, pos in stored:
         known_by_role.setdefault(character_id, set()).add((gacha_ts, pos))
-    full = full_check_due(owner_id, datetime.now(TZ).date())
+    full = weekly_turn(owner_id, datetime.now(TZ).date())
     # 一个森空岛账号可能带有第二个终末地绑定，里面没有角色。抽卡记录 API 会拒绝它
     # （"Token is invalid"），不先去掉它，成员真正的角色也会一起判为失败。
     roles = [role for role in roles if role.role_id]
@@ -199,7 +196,7 @@ async def sync_user(owner_id: int) -> tuple[str, int]:
             await session.commit()
         synced += 1
     if not synced:
-        raise errors[0]
+        raise next((e for e in errors if not login_expired(e)), errors[0])
     return ("partial" if errors else "success"), total
 
 
@@ -259,8 +256,9 @@ async def queue_daily():
         return
     async with get_session() as session:
         users = list(await session.scalars(select(SkUser.owner_id).distinct()))
-    count = _queue.enqueue_day(now, users)
-    logger.info("auto-efgacha daily_queued users={}", count)
+        away = await paused_owners(session)
+    count = _queue.enqueue_day(now, [user for user in users if user not in away])
+    logger.info("auto-efgacha daily_queued users={} of={}", count, len(users))
 
 
 async def daily_tick():
@@ -291,10 +289,10 @@ async def _work():
             except asyncio.CancelledError:
                 raise  # 持久化的任务项留在队列里，等下次启动。
             except Exception as exc:
-                _queue.finish(item, "failed", retry=True)
-                logger.warning("auto-efgacha update_failed reason={} attempt={} error_type={}",
-                               item[2], item[3] + 1, type(exc).__name__)
-                await _tell_listeners(item[0], "failed", 0, item[3] >= 2)
+                status, final = _queue.fail(item, exc)
+                logger.warning("auto-efgacha update_failed reason={} attempt={} status={} error_type={}",
+                               item[2], item[3] + 1, status, type(exc).__name__)
+                await _tell_listeners(item[0], "failed", 0, final)
             else:
                 _queue.finish(item, status, records)
                 logger.info("auto-efgacha update_done reason={} status={} new_records={}",

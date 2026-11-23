@@ -12,7 +12,7 @@
 一次画出（超过上限分成几张）。
 
 此外，成员绑定的每个账号下的每个明日方舟角色每天同步一次，和终末地同在 01:00 这个时段
-（有自己的队列和 worker，用同一个 Queue 类）。官方 API 只保留有限时间内的抽卡记录，所以游戏
+（有自己的队列和 worker，用同一个 Queue 类；登录已过期时的处理也一样）。官方 API 只保留有限时间内的抽卡记录，所以游戏
 不再返回的记录，这里保存的仍然在。绑定之后（plugins.skland_bind_sign）立刻排一次同步，结束时通知
 sync_listeners；有明日方舟角色但还从未同步过的成员，也会在 SEEN_SECONDS 内排进队列，已有成员在本插件
 装上后都靠它同步了一次。
@@ -66,7 +66,8 @@ from nonebot_plugin_skland.services.gacha import get_all_gacha_records, group_ga
 from nonebot_plugin_skland.utils.message import send_request_error
 from nonebot_plugin_user import UserSession, get_user
 
-from plugins.skland_auto_gacha.core import Queue, TZ
+from plugins.skland_away import paused_owners
+from plugins.skland_auto_gacha.core import Queue, TZ, login_expired
 from plugins.quick_buttons import plain, rows_fit, send_buttons
 from plugins.shared import heybox_hint
 from plugins.strict_command import strict
@@ -400,7 +401,7 @@ async def insert_new(session, character_id: int, rows: Iterable[dict]) -> int:
 
 
 async def sync_user(owner_id: int) -> tuple[str, int]:
-    """同步成员的每个明日方舟角色：返回（"success" | "partial" | 原因，新增行数）；全部角色失败时抛异常，让队列重试。"""
+    """同步成员的每个明日方舟角色：返回（"success" | "partial" | 原因，新增行数）；全部角色失败时抛异常，交给队列处理。"""
     async with get_session() as session:  # 请求期间不持有事务
         rows = (await session.execute(
             select(Character.id, Character.account_id, Character.uid, SkUser.access_token)
@@ -429,7 +430,7 @@ async def sync_user(owner_id: int) -> tuple[str, int]:
         total += added
         synced += 1
     if not synced:
-        raise errors[0]
+        raise next((e for e in errors if not login_expired(e)), errors[0])
     return ("partial" if errors else "success"), total
 
 
@@ -443,7 +444,11 @@ async def queue_daily() -> None:
         return
     now = datetime.now(timezone.utc)
     if _queue.day_due(now):
-        logger.info("auto-arkgacha daily_queued users={}", _queue.enqueue_day(now, await _owners()))
+        owners = await _owners()
+        async with get_session() as session:
+            away = await paused_owners(session)
+        count = _queue.enqueue_day(now, [owner for owner in owners if owner not in away])
+        logger.info("auto-arkgacha daily_queued users={} of={}", count, len(owners))
 
 
 async def queue_unseen() -> None:
@@ -452,8 +457,11 @@ async def queue_unseen() -> None:
         return
     with _queue.connection() as db:
         known = {row[0] for row in db.execute("SELECT user_id FROM results UNION SELECT user_id FROM pending")}
-    for owner in set(await _owners()) - known:
-        _queue.enqueue(owner)
+    if unseen := set(await _owners()) - known:
+        async with get_session() as session:
+            unseen -= await paused_owners(session)
+        for owner in unseen:
+            _queue.enqueue(owner)
 
 
 async def poll_queue() -> None:
@@ -502,9 +510,9 @@ async def _work() -> None:
             except asyncio.CancelledError:
                 raise  # 这一项留在队列里，下次启动再处理
             except Exception as exc:
-                _queue.finish(item, "failed", retry=True)
-                logger.warning("auto-arkgacha update_failed reason={} attempt={} error_type={}", item[2], item[3] + 1, type(exc).__name__)
-                await _tell_listeners(item[0], "failed", 0, item[3] >= 2)
+                status, final = _queue.fail(item, exc)
+                logger.warning("auto-arkgacha update_failed reason={} attempt={} status={} error_type={}", item[2], item[3] + 1, status, type(exc).__name__)
+                await _tell_listeners(item[0], "failed", 0, final)
             else:
                 _queue.finish(item, status, records)
                 logger.info("auto-arkgacha update_done reason={} status={} new_records={}", item[2], status, records)

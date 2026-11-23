@@ -511,7 +511,7 @@ sign_status = on_command("签到详情", rule=strict, priority=5, block=True)
 @sign_all.handle()
 async def _(bot: OneBotV11Bot, user_session: UserSession, session: async_scoped_session) -> None:
     """两个游戏同时签，用每晚签到那一套（plugins/skland_health：几个账号并行、签完一个保存一个、
-    等重新绑定的成员不签），签完回复两份签到结果。"""
+    等重新绑定和疑似已离开的成员不签），签完回复两份签到结果。"""
     from plugins import skland_health  # 在本插件之后加载
 
     await asyncio.gather(skland_health.run_daily_sign("arknights"), skland_health.run_daily_sign("endfield"))

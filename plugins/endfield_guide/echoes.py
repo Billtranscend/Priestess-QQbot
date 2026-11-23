@@ -28,6 +28,7 @@ from nonebot_plugin_user.models import Bind
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
+from plugins.skland_away import paused_owners
 from plugins.skland_roles import default_role, member_roles, owner_id_of
 
 from .builds import CARD_URL, BuildStore, extract, role_roster
@@ -194,6 +195,9 @@ class EchoStore:
     async def _collect_into(self, data: dict, stats: Counter, optout: set[str], builds: BuildStore | None, build_members: dict, clears: bool) -> None:
         async with get_session() as session:
             every = [(str(n), b) for n, b in (await session.execute(select(Bind.platform_id, Bind.bind_id).where(Bind.platform == "QQClient"))).all()]
+            away = await paused_owners(session)
+        if (clears and data.get("schema", ECHO_SCHEMA) != ECHO_SCHEMA) or (builds is not None and not builds.current()):
+            away = set()  # 提取规则变了：这一轮所有人都重拉，旧格式的记录不能挂上新的版本号
         binds = list(people(every).items())
         left = {b for n, b in every if n in optout}  # 用哪个号退出的都算这个人退出了
         optout = optout | {qq for qq, b in binds if b in left}
@@ -212,7 +216,7 @@ class EchoStore:
             async with get_session(expire_on_commit=False, autoflush=False) as session:
                 while not queue.empty():
                     qq, bind_id = queue.get_nowait()
-                    await self._member(session, qq, bind_id, data, stats, optout, builds, build_members, clears)
+                    await self._member(session, qq, bind_id, data, stats, optout, builds, build_members, clears, bind_id in away)
                     done += 1
                     if done % 20 == 0:
                         logger.info(f"War Echoes collection progress: {done}/{len(binds)} binds, {dict(stats)}")
@@ -228,7 +232,8 @@ class EchoStore:
         except ExceptionGroup as failed:  # 调用方按异常类型记录原因：抛出里面的第一个异常，不抛 ExceptionGroup
             raise failed.exceptions[0] from None
 
-    async def _member(self, session, qq: str, bind_id: int, data: dict, stats: Counter, optout: set[str], builds: BuildStore | None, build_members: dict, clears: bool) -> None:
+    async def _member(self, session, qq: str, bind_id: int, data: dict, stats: Counter, optout: set[str], builds: BuildStore | None, build_members: dict, clears: bool,
+                      paused: bool = False) -> None:
         if qq in optout:
             data["members"].pop(qq, None)
             return
@@ -237,6 +242,9 @@ class EchoStore:
         selected = await default_role(session, bind_id)
         if selected is None:
             stats["dropped"] += data["members"].pop(qq, None) is not None
+            return
+        if paused:  # 疑似已离开的人不去拉取：留着上次的记录
+            stats["paused"] += 1
             return
         user, char = selected
         # API 返回错误 code 时立即删掉该群友；其他失败（网络、登录）重试一次。

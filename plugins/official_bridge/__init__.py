@@ -22,16 +22,16 @@ bot.py 总是加载本插件。各文件分工：
 - 原机器人的客户端连着的其他 OneBot v11 程序（nonebot-bison），在桥接机器人接手发推送后改由桥接
   去连接：地址和 token 不变（OFFICIAL_BRIDGE_ONEBOT_CLIENTS），见 relay.py。原机器人下线后自动
   改连。
-- 谁已经退出了所有群（每周森空岛检查会给他们解绑）按最新名单判断：用 no_cache 查桥接机器人的
+- 要最新完整名单（no_cache）时这样回答：查桥接机器人的
   群列表，得到两个机器人所在的全部群；用 no_cache 查成员名单，原机器人在的群得到原机器人看到的
   名单；只有官方机器人待过的群，用官方机器人见过的成员；原机器人已退出的群，用见过的成员加上
-  最终保存的名单。原机器人离线而仍有只归它的群时，或某个群有原群号却没有最终名单时，拒绝回答
-  这个问题，也不给任何人解绑。例外只有一种：原机器人已被确认不在任何群，而它在那个群从没留下过
-  名单，这时按只有官方机器人待过的群回答。
+  最终保存的名单。原机器人离线而仍有只归它的群时，或某个群有原群号却没有最终名单时，拒绝回答。
+  例外只有一种：原机器人已被确认不在任何群，而它在那个群从没留下过名单，这时按只有官方机器人待过的群
+  回答。每周森空岛检查不读这些名单，改问 present_numbers() 和 last_present()（见下）。
 - 为原机器人离开群之后准备成员名单：每天把原机器人看到的每个已关联群的完整成员名单存进编号映射表
   （`roster`）。在原机器人已离开的群里，成员名单（排行榜、周报）是官方机器人见过的成员加上最后
-  保存的那份名单。看到原机器人退群（或被移出）时，保存的名单标记为最终名单，此后它也用来回答每周
-  检查的问题：既不在这份名单上、也从没在任何地方被官方机器人见过的人，不在它的任何群里。
+  保存的那份名单。看到原机器人退群（或被移出）时，保存的名单标记为最终名单。名单上的人在
+  present_numbers() 里算在场，除非已认出、并在那个群有退群标记。
 - 合并转发卡片（多页的回复）没有对应物：各页依次发送，每条消息最多带一张图。设置了
   OFFICIAL_BRIDGE_FORWARD_STITCH_HEIGHT 时，只含图片的卡片改为拼成不超过该像素高度的长图
   （默认关闭）。
@@ -95,6 +95,30 @@ __plugin_meta__ = PluginMetadata(
     description="不改写现有插件，让机器人跑在 QQ 官方机器人平台上。",
     usage="/群检查",
 )
+
+
+def present_numbers() -> set[str]:
+    """还能证明在场的人现在的编号（字符串）：各活跃群里见过、没标退群的成员，名单表上没按认出的身份标退群的号，
+    机器人的好友（见 idmap.present_numbers）。plugins/skland_health 按它判断谁可能已经离开。不联网、不写库。
+
+    原机器人还可能在某个群里时抛错：那些群的成员不在本机器人的表里，不能当成离开。从零部署（从没有原机器人，
+    legacy_groups 也没记过）照常回答。
+    """
+    _only_this_bot()
+    return idmap.present_numbers()
+
+
+def last_present(numbers: list[str]) -> dict[str, float]:
+    """这些编号最后一次能证明在场的时间（见 idmap.last_present）：plugins/skland_away 计时和删之前复查用。"""
+    _only_this_bot()
+    return idmap.last_present(numbers)
+
+
+def _only_this_bot() -> None:
+    recorded = idmap.meta("legacy_groups")
+    if recorded not in (None, "[]") or (legacy_bots() and not legacy_left_for_good()):
+        raise RuntimeError("the old bot may still be in a group: who is present cannot be told from here")
+
 
 def bridge_for(bot: QQBot) -> Bridge:
     bridge = bridges.get(bot.self_id)
@@ -335,6 +359,31 @@ async def _start_group_checks() -> None:
     task.add_done_callback(background.discard)
 
 
+MEMBER_LISTS_FIRST = 300.0  # 启动后多久看第一轮该读的成员名单
+MEMBER_LISTS_EVERY = 3600.0  # 之后每隔多久看一轮（没权限时不查表、不发请求）
+
+
+async def _read_member_lists() -> None:
+    """平台开放成员名单以后，每个活跃群一天至少完整读一次（见 Bridge.read_due_lists）。"""
+    wait = MEMBER_LISTS_FIRST
+    while True:
+        await asyncio.sleep(wait)
+        wait = MEMBER_LISTS_EVERY
+        for qq_id, bridge in list(bridges.items()):
+            if qq_id not in online:
+                continue
+            try:
+                await bridge.read_due_lists()
+            except Exception as e:  # 不带调用栈：变量里有 OpenID
+                logger.warning(f"official bridge: member lists not read this round ({type(e).__name__})")
+
+
+@driver.on_startup
+async def _start_member_lists() -> None:
+    background.add(task := asyncio.create_task(_read_member_lists()))
+    task.add_done_callback(background.discard)
+
+
 async def _announce_join(bridge: Bridge, group_openid: str, notice, inbound=None) -> None:
     """只有当这个群对整个机器人来说是新群时，才告诉各插件“机器人进群了”。
 
@@ -416,7 +465,7 @@ async def _avatars_from_platform() -> None:
 # ---------------------------------------------------------------- /群检查
 
 group_check = on_command("群检查", rule=strict, permission=SUPERUSER, priority=5, block=True)
-CHECK_WORDS = {"named": "取到群名", "gone": "已解散或机器人已不在，已清除", "failed": "查询失败（下次再查）"}
+CHECK_WORDS = {"named": "取到群名", "gone": "已解散或机器人已不在，已清除", "doubtful": "平台说不存在（下次再这么说才清除）", "failed": "查询失败（下次再查）"}
 
 
 def adopt_group(group_id: int) -> bool:

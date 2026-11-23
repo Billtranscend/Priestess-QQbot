@@ -6,11 +6,23 @@ import sqlite3
 import time
 from collections.abc import Collection
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
+LOGIN_EXPIRED = "login_expired"  # 同步结果：每晚的同步因登录已过期而失败
+
+
+def weekly_turn(owner_id: int, day: date) -> bool:
+    """每个成员每周轮到一天（按 owner_id 错开）。"""
+    return owner_id % 7 == day.toordinal() % 7
+
+
+def login_expired(exc: BaseException) -> bool:
+    """换取授权时森空岛明确说登录已过期：重新扫码之前不会好。限流、超时和其他环节的错误都不算。"""
+    said = str(exc)
+    return "使用token获得认证代码失败" in said and "登录已过期" in said
 
 
 def daily_slot(now: datetime) -> str:
@@ -80,15 +92,19 @@ class Queue:
         return row is not None and row[0] != daily_slot(now)
 
     def enqueue_day(self, now: datetime, users: list[int]) -> int:
+        """排入这一晚的同步，返回排了多少人。登录已过期的成员只在每周轮到的那天排。"""
+        today = now.astimezone(TZ).date()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM meta WHERE key='day'").fetchone()
             if row and row[0] == daily_slot(now):
                 return 0
-            for uid in users:
+            expired = {uid for uid, in db.execute("SELECT user_id FROM results WHERE status=?", (LOGIN_EXPIRED,))}
+            queued = [uid for uid in users if uid not in expired or weekly_turn(uid, today)]
+            for uid in queued:
                 self._enqueue(db, uid, "daily")
             db.execute("INSERT OR REPLACE INTO meta VALUES ('day',?)", (daily_slot(now),))
-            return len(users)
+            return len(queued)
 
     def next(self, busy: Collection[int] = ()):
         """下一个到期的任务项；busy 里的成员正被别的 worker 处理，跳过。"""
@@ -116,6 +132,18 @@ class Queue:
                     (time.time() + (300 if attempts == 0 else 1800), uid, generation))
             else:
                 db.execute("DELETE FROM pending WHERE user_id=? AND generation=?", (uid, generation))
+
+    def fail(self, item, exc: BaseException) -> tuple[str, bool]:
+        """记下一次失败的同步，返回（记下的状态，是不是最终结果）。
+
+        每晚同步时登录已过期的不重试；绑定后的同步一律照常重试。
+        """
+        uid, _, reason, attempts = item
+        if reason == "daily" and login_expired(exc):
+            self.finish(item, LOGIN_EXPIRED)
+            return LOGIN_EXPIRED, not self.waiting(uid)  # 期间重新扫了码：等绑定后的那次同步
+        self.finish(item, "failed", retry=True)
+        return "failed", attempts >= 2
 
 
 def record_values(character_id, record):

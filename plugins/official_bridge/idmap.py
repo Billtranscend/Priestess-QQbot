@@ -11,8 +11,11 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 # QQ 号和群号都是 32 位的；比这更大的数不会和真实号码冲突。
@@ -59,6 +62,19 @@ CREATE TABLE IF NOT EXISTS roster (
     joined_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (gid, uid)
 );
+CREATE TABLE IF NOT EXISTS departed (
+    group_openid TEXT NOT NULL,
+    openid TEXT NOT NULL,
+    left_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (group_openid, openid)
+);
+CREATE TABLE IF NOT EXISTS unlisted (
+    group_openid TEXT NOT NULL,
+    openid TEXT NOT NULL,
+    since REAL NOT NULL,
+    PRIMARY KEY (group_openid, openid)
+);
+CREATE INDEX IF NOT EXISTS members_by_openid ON members (openid);
 """
 
 
@@ -105,11 +121,13 @@ class IdMap:
                 (openid, uid, nickname or "", int(friend), time.time()),
             )
             return uid
-        if (nickname and nickname != row["nickname"]) or (friend and not row["friend"]):
+        if friend and not row["friend"]:
             self._db.execute(
-                "UPDATE users SET nickname = ?, friend = MAX(friend, ?), updated_at = ? WHERE openid = ?",
-                (nickname or row["nickname"], int(friend), time.time(), openid),
+                "UPDATE users SET nickname = ?, friend = 1, updated_at = ? WHERE openid = ?", (nickname or row["nickname"], time.time(), openid)
             )
+        elif nickname and nickname != row["nickname"]:
+            # 只是名字变了不算露面：被 @、名单、引用里都会带来新名字，updated_at 是 last_present 的一项
+            self._db.execute("UPDATE users SET nickname = ? WHERE openid = ?", (nickname, openid))
         return row["uid"]
 
     def user_openid(self, uid: int) -> str | None:
@@ -191,6 +209,21 @@ class IdMap:
     def set_meta(self, key: str, value: str) -> None:
         self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
 
+    def drop_meta(self, key: str) -> None:
+        self._db.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """里面的多次写入合成一次提交（一次写盘）。里面不能再调用自己开事务的方法（link_user 等）。"""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._db.execute("COMMIT")
+        except BaseException:
+            if self._db.in_transaction:  # 提交也会失败：不能把事务开着留下，否则之后写的重启都会丢
+                self._db.execute("ROLLBACK")
+            raise
+
     def friends(self) -> list[sqlite3.Row]:
         return self._db.execute("SELECT * FROM users WHERE friend = 1").fetchall()
 
@@ -263,14 +296,18 @@ class IdMap:
 
     # 群里见过的成员
 
-    seen_every = 600.0  # 已在表里的成员再发言时，last_seen 最多隔这么多秒重写一次（读它的只有成员信息里的 last_sent_time）
+    seen_every = 600.0  # 已在表里的成员再发言时，last_seen 最多隔这么多秒重写一次（读它的有成员信息里的 last_sent_time、last_present 和进群时改不改身份）
 
-    def touch_member(self, group_openid: str, openid: str, role: str | None = None, nickname: str | None = None, joined_at: float | None = None, seen: bool = False) -> None:
-        """记录群里的一个成员：`seen` 表示刚发过言，否则表示来自平台给出的名单。
+    def touch_member(self, group_openid: str, openid: str, role: str | None = None, nickname: str | None = None, joined_at: float | None = None, seen: bool = False, listed: bool = False, at: float | None = None) -> bool:
+        """记录群里的一个成员：`seen` 表示刚发过言，`listed` 表示平台给出的成员名单里有他，两者都不是时是在 @ 里遇到的。
+        `at` 是那条消息的时间，或那份名单开始读的时间。
 
         成员是新的，或名字、身份、入群时间有变化，立刻写。只是又发了一次言时按 seen_every 节流：
         每条群消息都走到这里，而每次写入都要等硬盘确认。
+        记着已退群的人发了言或出现在平台名单里，就是又在群里了：去掉那条记录，不受节流影响（只被 @ 到不算）；
+        给了 `at` 时，要晚于记下的退群时间才算（见 clear_departed）。返回是否因此去掉了一条。
         """
+        back = (seen or listed) and self.clear_departed(group_openid, openid, at)
         row = self._db.execute(
             "SELECT role, nickname, joined_at, last_seen FROM members WHERE group_openid = ? AND openid = ?", (group_openid, openid)
         ).fetchone()
@@ -281,7 +318,7 @@ class IdMap:
                 and (not joined_at or joined_at <= 0 or joined_at == row["joined_at"])
             )
             if unchanged and (not seen or time.time() - (row["last_seen"] or 0) < self.seen_every):
-                return
+                return back
         last_seen = time.time() if seen else 0
         self._db.execute(
             "INSERT INTO members (group_openid, openid, role, nickname, joined_at, last_seen) VALUES (?, ?, ?, ?, ?, ?) "
@@ -291,12 +328,121 @@ class IdMap:
             (group_openid, openid, role or "member", nickname or "", joined_at or 0, last_seen,
              role, nickname or "", joined_at or 0, joined_at or 0, last_seen),
         )
+        return back
 
     def member(self, group_openid: str, openid: str) -> sqlite3.Row | None:
         return self._db.execute("SELECT * FROM members WHERE group_openid = ? AND openid = ?", (group_openid, openid)).fetchone()
 
     def members(self, group_openid: str) -> list[sqlite3.Row]:
         return self._db.execute("SELECT * FROM members WHERE group_openid = ? AND openid != ?", (group_openid, SELF)).fetchall()
+
+    # 平台说已退群的成员（群成员事件；隔开的两次完整名单上都没有、第二次还核对得上）。members 里的行不删，只另记一笔：
+    # 普通名单、成员信息和 present_numbers / last_present（周检据此判断谁可能已经离开）按它把人算作不在这个群。
+    # 他再进群、再发言或出现在平台名单里时去掉。只有一次不在完整名单上的记在 unlisted，照样算在场。
+
+    def mark_departed(self, group_openid: str, openid: str, at: float | None = None) -> None:
+        self._db.execute(
+            "INSERT INTO departed (group_openid, openid, left_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(group_openid, openid) DO UPDATE SET left_at = MAX(left_at, excluded.left_at)",  # 晚到的旧退群不把时间往回拉
+            (group_openid, openid, at or time.time()),
+        )
+        self._db.execute("DELETE FROM unlisted WHERE group_openid = ? AND openid = ?", (group_openid, openid))  # 已经定了，不必再等第二次
+
+    def clear_departed(self, group_openid: str, openid: str, after: float | None = None, ties: bool = False) -> bool:
+        """去掉退群记录，返回去掉了没有。给了 after（发言、进群的时间，或名单开始读的时间）时，只有晚于记下的
+        退群时间才去掉：退群前发的、却在退群事件之后才到的消息不算回来。`ties` 为真时同一秒也算晚于（进群：
+        平台的时间只到秒，同一秒里退了又进的人应当在群里）。先读：每条群消息都走到这里，
+        绝大多数人没有这条记录，不必写盘。
+        "有一次名单上没有他"（unlisted）不论时间一律作废：那只会让判定退群晚一次读取。"""
+        if self._db.execute("SELECT 1 FROM unlisted WHERE group_openid = ? AND openid = ?", (group_openid, openid)).fetchone():
+            self._db.execute("DELETE FROM unlisted WHERE group_openid = ? AND openid = ?", (group_openid, openid))
+        row = self._db.execute("SELECT left_at FROM departed WHERE group_openid = ? AND openid = ?", (group_openid, openid)).fetchone()
+        if row is None or (after is not None and (after < row["left_at"] if ties else after <= row["left_at"])):
+            return False
+        self._db.execute("DELETE FROM departed WHERE group_openid = ? AND openid = ?", (group_openid, openid))
+        return True
+
+    def has_departed(self, group_openid: str, openid: str) -> bool:
+        return self._db.execute("SELECT 1 FROM departed WHERE group_openid = ? AND openid = ?", (group_openid, openid)).fetchone() is not None
+
+    def known_in(self, group_openid: str, gid: int) -> set[str]:
+        """记录里这个群的人：见过的成员，和名单表上已认出的人（按 OpenID）。"""
+        known = {row["openid"] for row in self.members(group_openid)}
+        known |= {row["openid"] for row in self._db.execute(
+            "SELECT u.openid FROM roster r JOIN users u ON u.uid = r.uid WHERE r.gid = ? AND u.linked = 1", (int(gid),))}
+        return known
+
+    def unlisted_in(self, group_openid: str) -> set[str]:
+        """已经有一次不在完整名单上、之后没再露过面、也还没记成退群的人。"""
+        return {row["openid"] for row in self._db.execute("SELECT openid FROM unlisted WHERE group_openid = ?", (group_openid,))}
+
+    def mark_absent(self, group_openid: str, gid: int, listed: set[str], at: float | None = None, known: set[str] | None = None,
+                    confirmed: set[str] | None = None) -> int:
+        """平台给出了这个群完整的成员名单：我们记着、名单上却没有的人，第一次只记下时间（照样算在场）；`confirmed` 里的
+        （早先一次就没有、这次又核对过）才记成已退群，时间算第一次没有他的那次。`known` 是开读之前记录里的人（读的过程中
+        才因为被 @ 而记下的新人不算）；没给时取现在的。不删成员行和名单行。返回新记成退群的人数。"""
+        known = self.known_in(group_openid, gid) if known is None else known
+        confirmed = confirmed or set()
+        missing = [openid for openid in sorted(known - listed) if not self.has_departed(group_openid, openid)]
+        noted = 0
+        with self.transaction():
+            for openid in missing:
+                row = self._db.execute("SELECT since FROM unlisted WHERE group_openid = ? AND openid = ?", (group_openid, openid)).fetchone()
+                if row is None:
+                    self._db.execute("INSERT INTO unlisted (group_openid, openid, since) VALUES (?, ?, ?)", (group_openid, openid, at or time.time()))
+                elif openid in confirmed:
+                    self.mark_departed(group_openid, openid, row["since"])
+                    noted += 1
+        return noted
+
+    def count_known(self, group_openid: str, gid: int, self_id: int) -> int:
+        """群人数：和 Bridge._members_known 列出的一样多（不看退群标记），但不逐人取资料：读全过名单的群一个就有成百上千人。"""
+        return self._db.execute(
+            "SELECT (SELECT COUNT(*) FROM members WHERE group_openid = ?1 AND openid != ?2) + "
+            "(SELECT COUNT(*) FROM roster r WHERE r.gid = ?3 AND r.uid != ?4 AND r.uid NOT IN ("
+            "SELECT u.uid FROM members m JOIN users u ON u.openid = m.openid WHERE m.group_openid = ?1 AND m.openid != ?2))",
+            (group_openid, SELF, int(gid), int(self_id)),
+        ).fetchone()[0]
+
+    def departed_uids(self, group_openid: str) -> set[int]:
+        """该群已退群成员现在的编号。认出的人是 QQ 号，名单表（roster）里按 QQ 号记的同一个人也就对得上。"""
+        rows = self._db.execute("SELECT u.uid FROM departed d JOIN users u ON u.openid = d.openid WHERE d.group_openid = ?", (group_openid,))
+        return {row["uid"] for row in rows}
+
+    def present_numbers(self) -> set[str]:
+        """还能证明在场的人现在的编号（字符串）：活跃群里见过、在那个群没有退群标记的成员；活跃群名单表上的号，
+        除非它已认出、而认出的 OpenID 在那个群有退群标记；机器人的好友。一条查询，不联网、不写库。"""
+        rows = self._db.execute(
+            "SELECT u.uid FROM members m JOIN groups g ON g.openid = m.group_openid AND g.active = 1 "
+            "JOIN users u ON u.openid = m.openid "
+            "WHERE m.openid != ? AND NOT EXISTS (SELECT 1 FROM departed d WHERE d.group_openid = m.group_openid AND d.openid = m.openid) "
+            "UNION SELECT r.uid FROM roster r JOIN groups g ON g.gid = r.gid AND g.active = 1 "
+            "WHERE NOT EXISTS (SELECT 1 FROM users u JOIN departed d ON d.openid = u.openid AND d.group_openid = g.openid "
+            "WHERE u.uid = r.uid AND u.linked = 1) "
+            "UNION SELECT uid FROM users WHERE friend = 1",
+            (SELF,),
+        )
+        return {str(row[0]) for row in rows}
+
+    def last_present(self, numbers: Iterable[str]) -> dict[str, float]:
+        """这些编号最后一次能证明在场是什么时候：现在就在场（口径同 present_numbers）的是现在；否则取最晚的一次
+        发言、退群、身份或好友变动。没有任何痕迹的不在结果里。一条查询，不联网、不写库。"""
+        wanted = json.dumps([int(number) for number in numbers if str(number).isdigit()])
+        rows = self._db.execute(
+            "WITH who AS (SELECT openid, uid, friend, updated_at FROM users WHERE uid IN (SELECT value FROM json_each(?1))) "
+            "SELECT uid, MAX(at) FROM ("
+            "SELECT uid, CASE WHEN friend = 1 THEN ?2 ELSE updated_at END AS at FROM who "
+            "UNION ALL SELECT w.uid, CASE WHEN g.active = 1 AND d.openid IS NULL THEN ?2 ELSE m.last_seen END "
+            "FROM members m JOIN who w ON w.openid = m.openid LEFT JOIN groups g ON g.openid = m.group_openid "
+            "LEFT JOIN departed d ON d.group_openid = m.group_openid AND d.openid = m.openid "
+            "UNION ALL SELECT w.uid, d.left_at FROM departed d JOIN who w ON w.openid = d.openid "
+            "UNION ALL SELECT r.uid, ?2 FROM roster r JOIN groups g ON g.gid = r.gid AND g.active = 1 "
+            "WHERE r.uid IN (SELECT value FROM json_each(?1)) AND NOT EXISTS (SELECT 1 FROM users u "
+            "JOIN departed d ON d.openid = u.openid AND d.group_openid = g.openid WHERE u.uid = r.uid AND u.linked = 1)"
+            ") GROUP BY uid",
+            (wanted, time.time()),
+        )
+        return {str(uid): float(at) for uid, at in rows}
 
     # 另一个机器人最后一次给出的某群完整成员名单，留到那个机器人离开该群后使用
 
@@ -326,9 +472,18 @@ class IdMap:
         gid = int(row["gid"])
         self._db.execute("BEGIN IMMEDIATE")
         try:
+            # 删掉之前，把这个群能证明的最后一次在场留给 last_present：退了群的是退群那时，其他人是现在
+            self._db.execute(
+                "UPDATE users SET updated_at = MAX(updated_at, COALESCE((SELECT left_at FROM departed WHERE group_openid = ?1 AND openid = users.openid), ?2)) "
+                "WHERE openid IN (SELECT openid FROM members WHERE group_openid = ?1 UNION SELECT openid FROM departed WHERE group_openid = ?1)",
+                (openid, time.time()),
+            )
             self._db.execute("DELETE FROM members WHERE group_openid = ?", (openid,))
+            self._db.execute("DELETE FROM departed WHERE group_openid = ?", (openid,))
             self._db.execute("DELETE FROM roster WHERE gid = ?", (gid,))
-            self._db.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"roster_taken:{gid}", f"roster_final:{gid}"))
+            self._db.execute("DELETE FROM unlisted WHERE group_openid = ?", (openid,))
+            self._db.execute("DELETE FROM meta WHERE key IN (?, ?, ?, ?, ?)", (f"roster_taken:{gid}", f"roster_final:{gid}",
+                             f"group_gone_once:{openid}", f"members_read:{openid}", f"members_tried:{openid}"))
             self._db.execute("DELETE FROM groups WHERE openid = ?", (openid,))
             self._db.execute("COMMIT")
         except BaseException:
@@ -354,8 +509,3 @@ class IdMap:
             self.set_meta(f"roster_final:{int(gid)}", str(time.time()))
         else:
             self._db.execute("DELETE FROM meta WHERE key = ?", (f"roster_final:{int(gid)}",))
-
-    def drop_members(self, group_openid: str, keep: set[str]) -> None:
-        for row in self.members(group_openid):
-            if row["openid"] not in keep:
-                self._db.execute("DELETE FROM members WHERE group_openid = ? AND openid = ?", (group_openid, row["openid"]))
