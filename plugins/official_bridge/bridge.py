@@ -137,6 +137,7 @@ _URL = re.compile(r"https?://[^\s]+|(?<![\w@])(?:[\w-]+\.)+[a-z]{2,}(?:/[^\s]*)?
 
 # 群里真正的 @（能点、有提醒）只在 markdown 消息里有效；文字消息和图片消息里平台都原样显示标记。
 MENTION_WAIT = 4.0  # 秒：图片里 @ 不了人，等这么久看后面有没有按钮消息可以带上这个 @，没有就单独发一条（带一句说明）
+MENTION_HOLD_MAX = 120.0  # 秒：这个群还有消息在发（多页图片的下一张还在上传）时，补发的 @ 最多再等这么久（到上限后再留一次 MENTION_WAIT）
 GROUP_GONE = 11255  # 平台：请求的资源不存在（用户/群已注销）
 GROUP_INFO_PACE = 2.2  # 秒：群信息接口每分钟最多 30 次
 
@@ -391,6 +392,7 @@ class Bridge:
         self.self_id = int(self_id)
         self.mention_markup = mention_markup
         self._waiting_mentions: dict[tuple[str, str], tuple[str, asyncio.Task]] = {}  # (群, 成员) -> 图片里没 @ 上的他，等着交给他的下一条按钮消息
+        self._sending: dict[str, int] = {}  # 群 -> 正在发往这个群的消息（含合并转发的整组）有几处：补发的 @ 等它们发完
         self._addressed: deque[int] = deque(maxlen=500)  # 已经点过名的指令消息：同一次回复只 @ 一次
         self.members_authoritative = members_authoritative
         self.ledger = Ledger()
@@ -965,7 +967,27 @@ class Bridge:
             result = await inline(**target, file_type=part.file_type, srv_send_msg=False, **source)
         return result.file_info
 
+    def _sending_more(self, kind: str, openid: str) -> None:
+        if kind == GROUP:
+            self._sending[openid] = self._sending.get(openid, 0) + 1
+
+    def _sending_less(self, kind: str, openid: str) -> None:
+        if kind == GROUP:
+            left = self._sending.get(openid, 1) - 1
+            if left > 0:
+                self._sending[openid] = left
+            else:
+                self._sending.pop(openid, None)
+
     async def _post(self, kind: str, openid: str, part: Part) -> tuple[str, str | None]:
+        """发一段；发往群的期间记在 _sending 里（上传图片可能要好几秒），补发的 @ 等它发完再发。"""
+        self._sending_more(kind, openid)
+        try:
+            return await self._post_part(kind, openid, part)
+        finally:
+            self._sending_less(kind, openid)
+
+    async def _post_part(self, kind: str, openid: str, part: Part) -> tuple[str, str | None]:
         post = self.qq.post_group_messages if kind == GROUP else self.qq.post_c2c_messages
         target = {"group_openid": openid} if kind == GROUP else {"openid": openid}
         text = part.text
@@ -1154,6 +1176,14 @@ class Bridge:
 
     async def _mention_alone(self, openid: str, member: str, asked: str = "") -> None:
         await asyncio.sleep(MENTION_WAIT)
+        # 这个群还有消息在发（多页图片的下一张还在上传、整组合并转发还没发完）：等它们都发完，再等 MENTION_WAIT，
+        # 让紧跟着的按钮消息有时间把 @ 带走；@ 因此落在最后。为在发的消息最多等 MENTION_HOLD_MAX 秒。
+        # 同一成员后面又有带他 @ 的图时，会重新计时并取消这一次。等的期间仍登记在 _waiting_mentions 里，按钮消息随时可以带走它。
+        hold_until = time.monotonic() + MENTION_HOLD_MAX
+        while self._sending.get(openid) and time.monotonic() < hold_until:
+            while self._sending.get(openid) and time.monotonic() < hold_until:
+                await asyncio.sleep(0.2)
+            await asyncio.sleep(MENTION_WAIT)
         self._waiting_mentions.pop((openid, member), None)
         try:
             inbound = self._pick_inbound(GROUP, openid)
@@ -1341,6 +1371,14 @@ class Bridge:
         return {"message_id": await self.send(C2C, self._user(user_id), message)}
 
     async def _forward(self, kind: str, openid: str, messages: Any) -> dict:
+        """官方一侧没有合并转发卡片：它的各页依次发出（见 _forward_pages）。整组发完之前都算在发，补发的 @ 落在最后一页之后。"""
+        self._sending_more(kind, openid)
+        try:
+            return await self._forward_pages(kind, openid, messages)
+        finally:
+            self._sending_less(kind, openid)
+
+    async def _forward_pages(self, kind: str, openid: str, messages: Any) -> dict:
         """官方一侧没有合并转发卡片：它的各页依次发出。
 
         每页只有一张图的卡片这样发会刷屏（而且每条消息最多带一张图），所以把这些图在 stitch_height

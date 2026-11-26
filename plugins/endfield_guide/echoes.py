@@ -32,7 +32,7 @@ from plugins.skland_away import paused_owners
 from plugins.skland_roles import default_role, member_roles, owner_id_of
 
 from .builds import CARD_URL, BuildStore, extract, role_roster
-from plugins.shared import write_json
+from plugins.shared import tell_superusers, write_json
 
 WAR_ECHOES_URL = "https://zonai.skland.com/api/v1/game/endfield/card/war-echoes"
 INDIE_HARD_URL = "https://zonai.skland.com/api/v1/game/endfield/card/indie-hard"  # 影拓丰碑
@@ -43,6 +43,8 @@ SAVE_SECONDS = 300  # 采集中途隔多久保存一次通关记录：整份约 
 COMMIT_TRIES = 4  # 保存 token 时数据库被别的写操作锁住：最多试几次
 SSL_CONTEXT = httpx.create_ssl_context()  # 所有请求共用：每个客户端现建一份证书配置要在主线程卡约 25 毫秒
 ECHO_SCHEMA = 2  # 2：同一关在多个赛季重复出现时保留最快的通关（1 保留的是最新的）
+OUTAGE_MIN = 20  # 一轮拉取失败的人数超过 max(OUTAGE_MIN, 人数 × OUTAGE_SHARE) 算森空岛故障：失败的群友保留上一轮的记录
+OUTAGE_SHARE = 0.1
 
 
 class RecordError(RuntimeError):
@@ -178,9 +180,13 @@ class EchoStore:
                 await held.enter_async_context(self.lock)
                 self.collecting = True
                 held.callback(setattr, self, "collecting", False)
+            # 拿到锁才算开始：两趟赶到一起时，后一趟在等锁的时候不记开始，前一趟的结束行就不会让它看起来已经停了。
+            # deploy/restart_when_idle.py 认这三行的开头（开始了没结束就不重启），改字时两边一起改
+            started, stats = time.time(), Counter()
+            logger.info("War Echoes collection started")
+            held.push_async_exit(_log_end(started, stats))
             optout = self.optout()
             data = self.load()
-            stats = Counter()
             build_members = builds.load().get("members") or {} if builds else {}
             try:
                 await self._collect_into(data, stats, optout, builds, build_members, clears)
@@ -209,6 +215,7 @@ class EchoStore:
         for bind in binds:
             queue.put_nowait(bind)
         done, saved = 0, time.monotonic()
+        missed: set[str] = set()  # 这一轮没拉到通关记录的群友：上一轮的记录先留着，这一轮结束时再定
 
         async def worker() -> None:
             # 每个 worker 一个 session：AsyncSession 不能被并发任务共用。
@@ -216,7 +223,8 @@ class EchoStore:
             async with get_session(expire_on_commit=False, autoflush=False) as session:
                 while not queue.empty():
                     qq, bind_id = queue.get_nowait()
-                    await self._member(session, qq, bind_id, data, stats, optout, builds, build_members, clears, bind_id in away)
+                    if await self._member(session, qq, bind_id, data, stats, optout, builds, build_members, clears, bind_id in away):
+                        missed.add(qq)
                     done += 1
                     if done % 20 == 0:
                         logger.info(f"War Echoes collection progress: {done}/{len(binds)} binds, {dict(stats)}")
@@ -225,30 +233,36 @@ class EchoStore:
                         data["schema"] = ECHO_SCHEMA
                         self._save(data)
 
+        finished = False
         try:
             async with asyncio.TaskGroup() as group:  # 一个 worker 失败会在最终保存前停掉其他 worker
                 for _ in range(WORKERS):
                     group.create_task(worker())
+            finished = True
         except ExceptionGroup as failed:  # 调用方按异常类型记录原因：抛出里面的第一个异常，不抛 ExceptionGroup
             raise failed.exceptions[0] from None
+        finally:  # 中途停下的一轮也在这里定，随后由 collect 保存
+            await _settle_missed(data, stats, missed, done, finished)
 
     async def _member(self, session, qq: str, bind_id: int, data: dict, stats: Counter, optout: set[str], builds: BuildStore | None, build_members: dict, clears: bool,
-                      paused: bool = False) -> None:
+                      paused: bool = False) -> bool:
+        """拉取一位群友；返回这一轮是否没拉到他的通关记录。"""
         if qq in optout:
             data["members"].pop(qq, None)
-            return
+            return False
         # 每位群友一条：其默认的终末地角色（上次之后解绑了，或没有这样的角色：
         # 榜单上就不留过时的通关记录）。
         selected = await default_role(session, bind_id)
         if selected is None:
             stats["dropped"] += data["members"].pop(qq, None) is not None
-            return
+            return False
         if paused:  # 疑似已离开的人不去拉取：留着上次的记录
             stats["paused"] += 1
-            return
+            return False
         user, char = selected
-        # API 返回错误 code 时立即删掉该群友；其他失败（网络、登录）重试一次。
-        # 仍然失败的群友也删掉，免得过时的通关记录留在榜单上。
+        failed = False
+        # API 返回错误 code 时不再重试；其他失败（网络、登录）重试一次。仍然失败的群友由 _settle_missed
+        # 在这一轮结束时决定：删掉（免得过时的通关记录留在榜单上），或者像森空岛故障时留着上一轮的记录。
         for attempt in range(2 if clears else 0):
             try:
                 echoes = await _fetch(WAR_ECHOES_URL, user, char)
@@ -264,10 +278,10 @@ class EchoStore:
             except Exception as e:
                 if isinstance(e, RecordError) or attempt:
                     stats[type(e).__name__] += 1
-                    stats["dropped"] += data["members"].pop(qq, None) is not None
+                    failed = True
                     break
                 await asyncio.sleep(REQUEST_GAP * 2)
-        if builds is not None and qq in data["members"]:
+        if builds is not None and qq in data["members"] and not failed:
             try:  # 失败时保留该群友之前的快照
                 if clears:
                     await asyncio.sleep(REQUEST_GAP)
@@ -283,6 +297,7 @@ class EchoStore:
         # 好几分钟，导致绑定 / 抽卡记录更新失败。
         await _commit(session, stats)
         await asyncio.sleep(REQUEST_GAP)
+        return failed
 
 
     @staticmethod
@@ -304,6 +319,19 @@ class EchoStore:
         return rosters
 
 
+def _log_end(started: float, stats: Counter):
+    """采集结束时记一行：成了记 collected 和各项计数，出错记 failed（异常照样往外抛）。"""
+
+    async def end(kind, error, trace) -> bool:
+        if error is None:
+            logger.info(f"War Echoes clears collected in {time.time() - started:.0f}s: {dict(stats)}")
+        else:
+            logger.warning(f"War Echoes collection failed: {type(error).__name__}")
+        return False
+
+    return end
+
+
 async def _commit(session, stats: Counter) -> None:
     """保存刷新过的 token；数据库被别的写操作锁住时先等，等不到就放弃（下次会再刷新 token）。
 
@@ -318,6 +346,22 @@ async def _commit(session, stats: Counter) -> None:
             if attempt < COMMIT_TRIES:  # 最后一次失败后直接放弃
                 await asyncio.sleep(3 * attempt)
     stats["commit_locked"] += 1
+
+
+async def _settle_missed(data: dict, stats: Counter, missed: set[str], processed: int, finished: bool) -> None:
+    """这一轮没拉到的群友：正常跑完、失败人数也没超过故障门槛（按这一轮处理过的人数算）时，删掉他们上一轮的记录；
+    否则留着（配装统计因此也留着他们），超过门槛时私聊告诉超级用户。"""
+    outage = len(missed) > max(OUTAGE_MIN, processed * OUTAGE_SHARE)
+    if finished and not outage:
+        for qq in missed:
+            stats["dropped"] += data["members"].pop(qq, None) is not None
+        return
+    if not missed:
+        return
+    stats["kept"] = sum(qq in data["members"] for qq in missed)
+    logger.warning(f"War Echoes: {len(missed)} of {processed} members failed{'' if finished else ' before the round stopped'}, kept their previous records")
+    if outage:
+        await tell_superusers(f"战争回响这轮有 {len(missed)} 人拉取失败，超过故障门槛，已保留他们上一轮的数据", "War Echoes")
 
 
 async def _fetch(base_url: str, user: SkUser, char: Character) -> dict:

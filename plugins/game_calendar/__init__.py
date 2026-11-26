@@ -460,17 +460,19 @@ async def notice_picture(game: Game, opened: list[dict], now: datetime) -> bytes
 # ── 开放通知 ────────────────────────────────────────────────────────────
 
 
-def _load_state() -> dict[str, list[str]]:
+def _load_state() -> dict[str, dict]:
+    """announced：每个游戏已经通知过的 key；sending：正在群发的通知（它的 key 和已经发过的群），重启后接着发。"""
     try:
-        state = json.loads(STATE_FILE.read_text("utf-8")).get("announced")
+        saved = json.loads(STATE_FILE.read_text("utf-8"))
     except (OSError, ValueError):
-        return {}
-    return state if isinstance(state, dict) else {}
+        saved = {}
+    return {part: saved.get(part) if isinstance(saved.get(part), dict) else {} for part in ("announced", "sending")}
 
 
-def _save_state(state: dict[str, list[str]]) -> None:
+def _save_state(state: dict[str, dict]) -> None:
     STATE_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    write_json(STATE_FILE, {"announced": {game: sorted(keys) for game, keys in state.items()}}, ensure_ascii=False)
+    announced = {game: sorted(keys) for game, keys in state["announced"].items()}
+    write_json(STATE_FILE, {"announced": announced, "sending": state["sending"]}, ensure_ascii=False)
 
 
 def due(items: list[dict], announced: set[str], now: datetime) -> tuple[list[dict], set[str]]:
@@ -484,14 +486,24 @@ def _quiet(now: datetime) -> bool:
     return QUIET_HOURS is not None and QUIET_HOURS[0] <= now.hour < QUIET_HOURS[1]
 
 
-async def _broadcast(image: bytes) -> dict[str, int]:
-    """把图发到每个群，不 @全体成员。不让机器人主动发言的群只试一次（refused），其他失败再试一次（fail）。"""
-    stats = {"ok": 0, "refused": 0, "fail": 0}
+async def _broadcast(image: bytes, done: list[int] | None = None, saved: Callable[[], None] = lambda: None,
+                     sent_to: list[int] | None = None) -> dict[str, int]:
+    """把图发到每个群，不 @全体成员。不让机器人主动发言的群只试一次（refused），其他失败再试一次（fail）。
+
+    done 里的群（重启前已经发过或拒收过）跳过（skipped）；送达或拒收的群随即加进 done（送达的同时加进 sent_to），
+    再调用 saved 记下来。
+    """
+    stats = {"ok": 0, "refused": 0, "fail": 0, "skipped": 0}
     bot = first_bot()
     if bot is None:
         return stats
+    done = [] if done is None else done
+    skip = set(done)
     for group in await bot.get_group_list():
-        refused = False
+        if group["group_id"] in skip:
+            stats["skipped"] += 1
+            continue
+        sent = refused = False
         for attempt in range(2):
             current = first_bot()  # 发送时间较长，期间连接可能已经重建
             try:
@@ -499,6 +511,7 @@ async def _broadcast(image: bytes) -> dict[str, int]:
                     raise RuntimeError("bot offline")
                 await current.send_group_msg(group_id=group["group_id"], message=MessageSegment.image(image))
                 stats["ok"] += 1
+                sent = True
                 break
             except Exception as e:
                 refused = unprompted_refused(e)
@@ -510,6 +523,11 @@ async def _broadcast(image: bytes) -> dict[str, int]:
                     logger.warning(f"Activity notice failed for one group: {type(e).__name__}")
                 else:
                     await asyncio.sleep(SEND_GAP)
+        if sent and sent_to is not None:
+            sent_to.append(group["group_id"])
+        if sent or refused:  # 失败的群不记：重启后还会再试
+            done.append(group["group_id"])
+            saved()
         if not refused:  # 被拒的群什么也没收到，不用为它等发送间隔
             await asyncio.sleep(SEND_GAP)
     return stats
@@ -518,27 +536,42 @@ async def _broadcast(image: bytes) -> dict[str, int]:
 _check_lock = asyncio.Lock()
 
 
-async def _check_game(game: Game, state: dict[str, list[str]], now: datetime) -> None:
+async def _check_game(game: Game, state: dict[str, dict], now: datetime) -> None:
     items = game.load()["activities"]
     if not items:  # 数据还没同步
         return
-    if game.key not in state:  # 这个游戏第一次运行：已经开放的都算旧消息
-        state[game.key] = sorted({key for a in items if a["start"] <= now for key in a["keys"]})
+    if game.key not in state["announced"]:  # 这个游戏第一次运行：已经开放的都算旧消息
+        state["announced"][game.key] = sorted({key for a in items if a["start"] <= now for key in a["keys"]})
         _save_state(state)
         logger.info(f"Activity notices armed for {game.key}: activities that are already open will not be announced")
         return
-    announced = set(state[game.key])
+    announced = set(state["announced"][game.key])
     fresh, stale = due(items, announced, now)
+    record = state["sending"].get(game.key)
+    if record and not any(a["keys"] & set(record["keys"]) for a in fresh):  # 没发完的那一轮已经过时：只记为已通知
+        stale |= set(record["keys"])
+        del state["sending"][game.key]
+        record = None
     if stale:
         announced |= stale
-        state[game.key] = sorted(announced)
+        state["announced"][game.key] = sorted(announced)
         _save_state(state)
     if not fresh or _quiet(now):
         return
+    if record and record.get("sent"):  # 重启前已经送达了一些群：只发那一轮的活动，已经发过的群跳过
+        fresh = [a for a in fresh if a["keys"] & set(record["keys"])]
+    else:  # 还没有哪个群收到的那一轮作废：这期间新开的活动并进同一张图；拒收过的群照旧跳过
+        refused = list(record["done"]) if record else []
+        record = state["sending"][game.key] = {"keys": sorted({key for a in fresh for key in a["keys"]}), "done": refused, "sent": []}
+        _save_state(state)
     started = time.time()
-    stats = await _broadcast(await notice_picture(game, fresh, now))
-    if stats["ok"] or (stats["refused"] and not stats["fail"]):  # 一条都没发出去（机器人离线、出错）：下次检查时再试；全被拒收的再试也一样
-        state[game.key] = sorted(announced | {key for a in fresh for key in a["keys"]})
+    image = await notice_picture(game, fresh, now)
+    logger.info(f"Activity notice started for {len(fresh)} {game.key} activities, {len(record['done'])} groups already done")
+    stats = await _broadcast(image, record["done"], lambda: _save_state(state), record["sent"])
+    # 一条都没发出去（机器人离线、出错）：下次检查时再试；全被拒收的再试也一样，重启前发过的群按拒收算
+    if stats["ok"] or ((stats["refused"] or stats["skipped"]) and not stats["fail"]):
+        state["announced"][game.key] = sorted(announced | set(record["keys"]))
+        del state["sending"][game.key]
         _save_state(state)
     logger.info(f"Activity notice for {len(fresh)} {game.key} activities sent in {time.time() - started:.0f}s: {stats}")
 

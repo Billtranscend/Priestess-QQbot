@@ -219,9 +219,26 @@ class Game:
         if len(todo) > CHUNK:
             logger.info(f"{self.log}: counted {len(todo)} of {len(now)} members in {time.monotonic() - started:.0f}s")
 
-    async def stats(self) -> dict[int, Any]:
-        """每个成员的数字；保存的超过 REFRESH_AFTER 秒时先核对一次。"""
+    async def stats(self, asker: int | None = None) -> dict[int, Any]:
+        """每个成员的数字；保存的超过 REFRESH_AFTER 秒、或者查询的人（所有者 id）自己的记录或默认角色变了时，先核对一次。
+
+        只看查询的人：别人的变化照旧最多晚 REFRESH_AFTER 秒，他自己刚同步、导入或换了角色，马上就能看到。"""
         async with self.lock:
-            if self.checked_at is None or time.monotonic() - self.checked_at > REFRESH_AFTER:
+            if self.checked_at is None or time.monotonic() - self.checked_at > REFRESH_AFTER or await self._changed(asker):
                 await self.refresh()
             return {owner: stat for owner, (_, stat) in self.kept.items()}
+
+    async def _changed(self, owner: int | None) -> bool:
+        """这个成员现在的默认角色和记录，和保存数字时的还一样吗（只查他一个人，很快）。"""
+        if owner is None:
+            return False
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    self._of_default_roles(CharacterDefault.character_id, func.count(GachaRecord.id), func.max(GachaRecord.id))
+                    .where(CharacterDefault.owner_id == owner)
+                    .group_by(CharacterDefault.character_id)
+                )
+            ).first()
+        kept = self.kept.get(owner)
+        return (tuple(row) if row is not None else None) != (tuple(kept[0]) if kept is not None else None)

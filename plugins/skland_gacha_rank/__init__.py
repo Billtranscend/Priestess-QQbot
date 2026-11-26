@@ -125,7 +125,7 @@ def _save_optout(game: Game, qqs: set[str]) -> None:
     write_json(game.optout, sorted(qqs))
 
 
-@scheduler.scheduled_job("cron", hour=4, minute=30, timezone="Asia/Shanghai", id="skland_gacha_rank_recount", misfire_grace_time=3600)
+@scheduler.scheduled_job("cron", hour=1, minute=15, timezone="Asia/Shanghai", id="skland_gacha_rank_recount", misfire_grace_time=3600)
 async def _recount() -> None:
     """每晚把所有人重算一次：什么算 UP 取决于卡池表，而卡池表随游戏更新变化。"""
     for game in GAMES:
@@ -176,7 +176,9 @@ async def _cards(bot: Bot, event: MessageEvent) -> dict[str, str]:
 
 
 async def _collect(game: Game, bot: Bot, event: MessageEvent) -> list:
-    stats = await game.stats()
+    async with get_session() as session:
+        asker = await owner_id_of(session, str(event.user_id))
+    stats = await game.stats(asker)
     if not stats:
         return []
     async with get_session() as session:

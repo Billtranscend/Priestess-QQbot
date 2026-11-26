@@ -1,10 +1,12 @@
 """疑似已离开的成员：不在机器人任何一个群里（有退群记录的群不算），也不是机器人好友。
 
-平台不给成员名单时，退了所有已知的群不等于离开：他可能正在别的群潜水、还没被见过。所以不当场解绑：
-先停掉为他跑的定时任务（每晚签到、两款游戏的抽卡同步、卫戍榜统计、竞速和配装采集），他一被看见
-（发言、进群、加好友）就恢复、从头计时；连续 AWAY_DAYS 天都不在，每周体检才解绑（plugins/skland_health）。
+发现后先停掉为他跑的定时任务（每晚签到、两款游戏的抽卡同步、卫戍榜统计、竞速和配装采集），他一被看见
+（发言、进群、加好友）就恢复；每周体检时还是这样就解绑，体检当场才发现的也一样（plugins/skland_health，
+删除前的备份留 14 天）。平台不给成员名单时，「不在任何群」是靠退群记录和见过谁推断的：只在私聊里用过机器人、
+又删了好友的人，即使还在某个群里也会被当成离开；重新绑定就能再用。
 两次查询之间露过一面也算：桥接记着每个号最后一次能证明在场的时间（last_present）。
-等待重新绑定的人（官方机器人从未认出）不归这里管，见 plugins/skland_health/dormant.py。
+等待重新绑定的人（官方机器人从未认出）怎么认、留多久不归这里管（见 plugins/skland_health/dormant.py），
+但全员任务一样跳过他们：paused_owners 把两种人合在一起。
 
 普通模块，不是插件：每个全员任务和体检（预览也是）开始时问一次、记下计时，所以不逐群读名单。
 """
@@ -25,7 +27,7 @@ from sqlalchemy import select
 
 from plugins.shared import write_json
 
-AWAY_DAYS = 45
+AWAY_DAYS = 0  # 发现后多少天才解绑：0 = 遇到的第一次每周体检（包括当场发现的那次）
 AWAY_FILE = Path(__file__).resolve().parents[1] / "data" / "skland_health" / "away.json"
 
 
@@ -87,9 +89,22 @@ async def away_owners(session) -> dict[int, float] | None:
     return away
 
 
+async def superuser_owners(session) -> set[int]:
+    """绑着超级用户号码的所有者：不按离开解绑，也不按 14 天规则清（plugins/skland_health）。"""
+    superusers = {str(user) for user in get_driver().config.superusers}
+    if not superusers:
+        return set()
+    return set(await session.scalars(select(Bind.bind_id).where(Bind.platform_id.in_(superusers))))
+
+
 async def paused_owners(session) -> set[int]:
-    """全员任务这一次要跳过的所有者；查不清时是空集合。"""
-    return set(await away_owners(session) or ())
+    """全员任务这一次要跳过的所有者：疑似已离开的，加上等官方机器人认出的；哪一种查不清，那一种就当作没有。"""
+    paused = set(await away_owners(session) or ())
+    health = sys.modules.get("plugins.skland_health")  # 它导入本模块，这里绝不导入它
+    if health is not None:
+        waiting, _ = await health.members_waiting(session)
+        paused |= waiting or set()
+    return paused
 
 
 async def still_away(session, owner: int, since: float) -> bool:

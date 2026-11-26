@@ -64,7 +64,7 @@ from nonebot_plugin_alconna.uniseg.message import current_send_wrapper
 from nonebot_plugin_orm import get_session
 from nonebot_plugin_skland.api import SklandLoginAPI
 from nonebot_plugin_skland.commands import bind as bind_commands
-from nonebot_plugin_skland.db_handler import get_account_characters, get_accounts
+from nonebot_plugin_skland.db_handler import get_accounts
 from nonebot_plugin_skland.exception import (
     AccountIdentityResolutionError,
     BindingStateChangedError,
@@ -72,9 +72,8 @@ from nonebot_plugin_skland.exception import (
     RequestException,
 )
 from nonebot_plugin_skland.matcher import skland_command
-from nonebot_plugin_skland.model import SkUser
+from nonebot_plugin_skland.model import Character, SkUser
 from nonebot_plugin_skland.services import binding as binding_service
-from nonebot_plugin_skland.services.sign import sign_character
 from sqlalchemy import select
 
 from plugins import skland_ark_gacha as ark_gacha
@@ -94,6 +93,7 @@ BOUND = "绑定成功"
 NOTICE = "\n正在为你签到明日方舟和终末地、更新卫戍榜成绩（仅首次绑定，之后每天自动进行）"
 ADDED = "\n已添加为你的另一个森空岛账号，正在为新账号签到、更新卫戍榜成绩。发 /skl角色 查看全部角色和序号，发 /skl切换终末地角色 序号 或 /skl切换方舟角色 序号 更换默认角色"
 RENEWED = "\n登录凭证已更新，之前保存的抽卡记录都还在"
+RENEWED_DROPPED = "\n登录凭证已更新。已删除或封禁的角色和它们的记录已清除，其余抽卡记录都还在"
 SYNC_NOTICE = "\n正在拉取你的终末地和明日方舟抽卡记录，完成后会在这里通知你；收到通知前请先不要查看或更新抽卡记录"
 SYNC_BUSY = "正在自动拉取你的抽卡记录，完成后我会{where}通知你，请收到通知后再查看"
 HEYBOX_HINT = "\n" + shared.HEYBOX_HINT
@@ -134,20 +134,23 @@ def _install_notice(notice: str) -> None:
 async def sign_once(owner_id: int) -> dict[str, int]:
     """为成员的每个明日方舟 / 终末地角色签到；返回用于日志的计数。
 
-    今天已经签过的角色会回答“重复签到”，这不算失败。
+    今天已经签过的角色会回答“重复签到”，这不算失败；出了错的角色算失败。
+    每个账号用每晚签到的 _sign_account 签：自己的会话，刷新的 token 签完就保存，等森空岛时不占着数据库的写锁。
     """
-    stats = Counter()
+    from plugins import skland_health  # 在本插件之后加载
+
     # 自己的会话：这是绑定指令之后在后台跑的，指令的会话（scoped）在指令结束时就会被关掉
-    async with get_session(expire_on_commit=False) as session:
-        for account in await get_accounts(owner_id, session):
-            for character in await get_account_characters(account.id, session):
-                if character.app_code not in ("arknights", "endfield") or (character.app_code == "endfield" and not character.role_id):
-                    continue
-                result = (await sign_character(account, character, character.app_code))["result"]
-                failed = isinstance(result, str) and "重复签到" not in result
-                stats[f"{'ark' if character.app_code == 'arknights' else 'endfield'}_{'failed' if failed else 'ok'}"] += 1
-        await session.commit()  # 保存刷新过的 token
-    return dict(stats)
+    async with get_session() as session:
+        account_ids = [account.id for account in await get_accounts(owner_id, session)]
+    stats = Counter()
+    for account_id in account_ids:
+        for game, short in (("arknights", "ark"), ("endfield", "endfield")):
+            broken = [0]
+            for entry in await skland_health._sign_account(account_id, game, broken, "Sign-in after binding"):
+                failed = isinstance(entry["result"], str) and "重复签到" not in entry["result"]
+                stats[f"{short}_{'failed' if failed else 'ok'}"] += 1
+            stats[f"{short}_failed"] += broken[0]
+    return dict(+stats)
 
 
 async def _after_binding(owner_id: int, qq: str | None) -> None:
@@ -345,6 +348,8 @@ RESTORED = "已确认这个森空岛账号是你的，原来的绑定和抽卡�
 RESTORE_IN_PRIVATE = "这个森空岛账号之前已经绑定过，原来的绑定和记录都还在。要恢复：第一步，加我为好友；第二步，再发一次 /skl绑定，二维码会私聊发给你，扫完就恢复"
 OTHER_ACCOUNT = "扫码的森空岛账号和你已绑定的不是同一个，绑定没有改动。续期请用原来的账号扫码；想再绑定一个账号请发 /skl添加账号"
 NO_ROLES = "这个森空岛账号下没有可绑定的明日方舟或终末地角色，没有保存"
+INCOMPLETE_ROLES = "森空岛这次没有返回完整的角色列表，我没有改动，请稍后再试"
+NO_USABLE_ROLE = "这个森空岛账号下的角色都已{why}，绑定没有成功"
 CHANGED = "绑定数据在这期间发生了变化，没有保存，请重新发送指令"
 IDENTITY_FAILED = "现有账号的身份校验失败，请先发送 /skl角色更新，或用 /skl解绑 移除异常的账号"
 
@@ -367,7 +372,7 @@ async def _login_alive(user: SkUser) -> bool:
     try:
         from plugins import skland_health  # 在本插件之后加载
 
-        return (await skland_health._login(user))[0] != "登录已过期"
+        return (await skland_health._login(user))[0] not in (skland_health.EXPIRED, skland_health.DOUBTFUL)
     except Exception as e:
         logger.info(f"Skland bind guard: login check inconclusive ({type(e).__name__})")
         return True
@@ -580,13 +585,19 @@ async def _commit_with_followups(prepared, session):
             _remember_chat(owner_id, kind)  # 在绑定把同步排进队列之前，这样就不会错过结果
         except Exception as e:
             logger.warning(f"Skland binding: sync notice not armed: {type(e).__name__}")
+    target = prepared.target_account_id if kind == "renew" else None
+    before = set()
     try:
+        if target is not None:
+            before = set(await session.scalars(select(Character.id).where(Character.account_id == target)))
+            await session.rollback()  # 上游接着要自己开事务
         await _previous_commit(prepared, session)
     except BaseException:
         if kind:
             with contextlib.suppress(Exception):
                 _forget_chat(owner_id)  # 没有排同步，所以不会有任何报告
         raise
+    dropped = target is not None and await _renewal_dropped(session, owner_id, target, before)
     games = [game for game, queue in (("ef", auto_gacha), ("ark", ark_gacha)) if _queue_sync(queue, owner_id)]
     if not kind:
         return
@@ -594,13 +605,30 @@ async def _commit_with_followups(prepared, session):
         _expect(owner_id, games)
     except Exception as e:
         logger.warning(f"Skland binding: sync notice not armed: {type(e).__name__}")
-    _install_notice({"first": NOTICE, "renew": RENEWED, "add": ADDED}[kind] + (SYNC_NOTICE if games else ""))
+    _install_notice({"first": NOTICE, "renew": RENEWED_DROPPED if dropped else RENEWED, "add": ADDED}[kind] + (SYNC_NOTICE if games else ""))
     if kind != "renew":
         event = current_event.get(None)
         qq = event.get_user_id() if event is not None and hasattr(event, "get_user_id") else None
         task = asyncio.get_running_loop().create_task(_after_binding(owner_id, qq))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
+
+
+async def _renewal_dropped(session, owner_id: int, account_id: int, before: set) -> bool:
+    """续期保存时清掉了这个账号原有的角色（被封禁或删除）吗？清掉了就马上补上默认角色，不等周一体检。"""
+    dropped = False
+    try:
+        dropped = bool(before - set(await session.scalars(select(Character.id).where(Character.account_id == account_id))))
+        if dropped:
+            from plugins import skland_health  # 在本插件之后加载
+
+            await skland_health.ensure_defaults(session, [owner_id])
+        await session.commit()
+    except Exception as e:  # 绑定已经提交了，绝不能把它误报成绑定失败
+        logger.warning(f"Skland binding: defaults after a renewal not checked ({type(e).__name__})")
+        with contextlib.suppress(Exception):
+            await session.rollback()
+    return dropped
 
 
 def _queue_sync(queue, owner_id: int) -> bool:
@@ -650,23 +678,53 @@ async def _restore_identity(user_session, session, skland_user_id: str, own_acco
         return None
 
 
+def _no_usable_role(snapshot) -> str | None:
+    """扫到的账号下一个可用的角色都没有时，回复成员的话（按森空岛给的原因）；有可用角色时为 None。"""
+    if any(role.is_available for role in snapshot.roles):
+        return None
+    why = {role.unavailable_reason for role in snapshot.roles}
+    if not why:
+        return NO_ROLES
+    return NO_USABLE_ROLE.format(why="被封禁" if why == {"角色已封禁"} else "删除" if why == {"角色已删除"} else "被封禁或删除")
+
+
+async def _drops_a_game(session, account_id: int, snapshot) -> bool:
+    """重新绑定已有的账号时，森空岛这次的列表里根本没有这个账号已存的某款游戏（空列表、少了整款游戏）。
+
+    照常保存会把那款游戏的角色连同抽卡记录一起删掉，而这多半只是森空岛这次没返回完整。列表里有、只是
+    标着删除或封禁的不算：照常保存，那些角色随之清除。
+    """
+    stored = set(await session.scalars(select(Character.app_code).where(
+        Character.account_id == account_id, Character.app_code.in_(("arknights", "endfield")))))
+    await session.rollback()
+    return bool(stored - {role.app_code for role in snapshot.roles})
+
+
 @functools.wraps(_upstream_confirm)
 async def _confirm(*, owner_id, pending, snapshot, mode, user_session, session) -> None:
     """判断扫码 / 输入的凭据可以做什么，然后带或不带上游的确认提示保存它。"""
-    own_accounts = {account.skland_user_id for account in await get_accounts(owner_id, session)}
+    own_accounts = {account.skland_user_id: account.id for account in await get_accounts(owner_id, session)}
+    own = pending.skland_user_id in own_accounts
     taken = None
-    if pending.skland_user_id not in own_accounts:
+    if not own:
         taken = await session.scalar(select(SkUser.id).where(SkUser.skland_user_id == pending.skland_user_id, SkUser.owner_id != owner_id).limit(1))
     await session.rollback()
+    if own and await _drops_a_game(session, own_accounts[pending.skland_user_id], snapshot):  # 续期时整款游戏不见了：先当作森空岛没给全
+        logger.info("Skland bind guard: refused, Skland's list lacks a game this account has")
+        await UniMessage(INCOMPLETE_ROLES).send(at_sender=True)
+        return
+    if (refusal := _no_usable_role(snapshot)) is not None:  # 首次绑定、续期、添加账号、找回身份都一样；已绑定的其他账号不受影响
+        logger.info("Skland bind guard: refused, the scanned account has no usable role")
+        await UniMessage(refusal).send(at_sender=True)
+        return
     if taken is not None:
-        restored = await _restore_identity(user_session, session, pending.skland_user_id, own_accounts)
+        restored = await _restore_identity(user_session, session, pending.skland_user_id, set(own_accounts))
         if restored is not None:
             await UniMessage(restored).send(at_sender=True)
             return
         logger.info("Skland bind guard: refused, the account belongs to another QQ")
         await UniMessage(BOUND_ELSEWHERE).send(at_sender=True)
         return
-    own = pending.skland_user_id in own_accounts
     if own_accounts and not own:
         if _qrcode_scan() and not _add_requested():  # 为续期发出的二维码，却被另一个账号扫了
             logger.info("Skland bind guard: refused, re-scan with another account")
@@ -687,9 +745,6 @@ async def _confirm(*, owner_id, pending, snapshot, mode, user_session, session) 
     except (DuplicateAccountIdentityError, ValueError) as e:
         logger.warning(f"Skland binding not prepared: {type(e).__name__}")
         await UniMessage(IDENTITY_FAILED).send(at_sender=True)
-        return
-    if prepared.target_account_id is None and not any(role.is_available for role in snapshot.roles):
-        await UniMessage(NO_ROLES).send(at_sender=True)
         return
     token = _flow.set("renew" if own else "first")
     try:

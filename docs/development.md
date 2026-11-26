@@ -68,8 +68,9 @@ plugins/
   heybox_import/               从小黑盒导入早期抽卡记录
   weekly_report/               本周任务（/本周任务，发指令时生成）
   game_calendar/               两款游戏的活动日历和活动开启通知
-  skland_health/               账号体检；每晚签到和森空岛请求的超时重试；backup.py 是删除前的备份（backups/skland-health/ 下只追加的 .jsonl）；
-                               dormant.py 是迁移期间未认出成员的暂停和 45 天后解绑
+  skland_health/               账号体检；每晚签到（00:05 一轮签完两款）和森空岛请求的超时重试；backup.py 是删除前的备份（backups/skland-health/ 下只追加的 .jsonl）；
+                               inactive.py 是 14 天规则的判断；dormant.py 是迁移期间未认出成员的暂停和 45 天后解绑
+  skland_away.py               疑似已离开的成员（不在机器人任何群里、也不是好友）：先停掉为他跑的定时任务，周一体检时解绑
   skland_sanity/               /理智 查询
   skl_help/                    帮助图：help.html 按配置生成图片（render.py）；分类按钮和 /帮助 分类名 的文字版（guide.py）
   skland_ef_theme/             抽卡记录等页面的终末地风格模板，上游图片模板的小修正

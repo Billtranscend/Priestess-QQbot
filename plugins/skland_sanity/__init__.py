@@ -94,7 +94,7 @@ def _remaining(seconds: float) -> str:
 @sanity.handle()
 async def _(event: MessageEvent) -> None:
     lines = []
-    async with get_session() as session:
+    async with get_session(autoflush=False) as session:  # 刷新的 token 留到最后才提交：查下一个游戏时不占着写锁
         user = await _member_for_qq(session, str(event.user_id))
         if user is None:
             await sanity.finish("未绑定森空岛账号，请先发送 /skl绑定", at_sender=True)

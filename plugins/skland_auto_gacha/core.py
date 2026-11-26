@@ -25,14 +25,24 @@ def login_expired(exc: BaseException) -> bool:
     return "使用token获得认证代码失败" in said and "登录已过期" in said
 
 
+DAY_STARTS = (0, 30)  # 每晚同步的时刻（北京时间，时、分）：两款游戏的 TRIGGER 和这里的“一晚”都从这里算
+
+
 def daily_slot(now: datetime) -> str:
     local = now.astimezone(TZ)
-    last = local.replace(
-        hour=1, minute=0, second=0, microsecond=0
-    )
+    last = local.replace(hour=DAY_STARTS[0], minute=DAY_STARTS[1], second=0, microsecond=0)
     if last > local:
         last -= timedelta(days=1)
     return last.isoformat()
+
+
+def _new_night(stored: str, now: datetime) -> bool:
+    """存着的那一晚已经过去。按时间比，不按字符串：时刻改早以后，旧时刻记下的这一晚（如今天 01:00）
+    还在新的这一晚（今天 00:30）之后，不算又到了一晚，不会在白天多同步一次。读不懂的记录算过去了。"""
+    try:
+        return datetime.fromisoformat(stored) < datetime.fromisoformat(daily_slot(now))
+    except ValueError:
+        return True
 
 
 class Queue:
@@ -89,7 +99,7 @@ class Queue:
     def day_due(self, now: datetime) -> bool:
         with self.connection() as db:
             row = db.execute("SELECT value FROM meta WHERE key='day'").fetchone()
-        return row is not None and row[0] != daily_slot(now)
+        return row is not None and _new_night(row[0], now)
 
     def enqueue_day(self, now: datetime, users: list[int]) -> int:
         """排入这一晚的同步，返回排了多少人。登录已过期的成员只在每周轮到的那天排。"""
@@ -97,7 +107,7 @@ class Queue:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM meta WHERE key='day'").fetchone()
-            if row and row[0] == daily_slot(now):
+            if row and not _new_night(row[0], now):
                 return 0
             expired = {uid for uid, in db.execute("SELECT user_id FROM results WHERE status=?", (LOGIN_EXPIRED,))}
             queued = [uid for uid in users if uid not in expired or weekly_turn(uid, today)]

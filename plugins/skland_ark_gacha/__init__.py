@@ -11,7 +11,7 @@
 （按钮上写年份或月份），另有一个按钮拉取最新记录（刚拉取过时没有）。看别人的记录、用 -b / -l 截取时
 一次画出（超过上限分成几张）。
 
-此外，成员绑定的每个账号下的每个明日方舟角色每天同步一次，和终末地同在 01:00 这个时段
+此外，成员绑定的每个账号下的每个明日方舟角色每天同步一次，和终末地同在 00:30 开始
 （有自己的队列和 worker，用同一个 Queue 类；登录已过期时的处理也一样）。官方 API 只保留有限时间内的抽卡记录，所以游戏
 不再返回的记录，这里保存的仍然在。绑定之后（plugins.skland_bind_sign）立刻排一次同步，结束时通知
 sync_listeners；有明日方舟角色但还从未同步过的成员，也会在 SEEN_SECONDS 内排进队列，已有成员在本插件
@@ -21,6 +21,7 @@ sync_listeners；有明日方舟角色但还从未同步过的成员，也会在
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -39,8 +40,7 @@ from nonebot.exception import MatcherException
 from playwright.async_api import TimeoutError as PageTimeout
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
-from sqlalchemy import select, text
-from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy import select
 
 require("nonebot_plugin_skland")
 require("nonebot_plugin_apscheduler")
@@ -67,21 +67,21 @@ from nonebot_plugin_skland.utils.message import send_request_error
 from nonebot_plugin_user import UserSession, get_user
 
 from plugins.skland_away import paused_owners
-from plugins.skland_auto_gacha.core import Queue, TZ, login_expired
+from plugins.skland_auto_gacha.core import DAY_STARTS, Queue, TZ, login_expired
 from plugins.quick_buttons import plain, rows_fit, send_buttons
-from plugins.shared import heybox_hint
+from plugins.shared import begin_write, dialect_insert, heybox_hint, retry_deadlock
 from plugins.strict_command import strict
 
 __plugin_meta__ = PluginMetadata(
     name="Skland Arknights gacha",
-    description="明日方舟抽卡记录：查看已保存的记录、手动更新，以及每天 01:00 自动同步。",
+    description="明日方舟抽卡记录：查看已保存的记录、手动更新，以及每天 00:30 起自动同步。",
     usage="/mrfz抽卡记录　/mrfz抽卡记录更新",
     type="application",
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "data/skland_auto_gacha/ark_queue.sqlite3"
-TRIGGER = CronTrigger(hour=1, minute=0, second=0, timezone=TZ)
+TRIGGER = CronTrigger(hour=DAY_STARTS[0], minute=DAY_STARTS[1], second=0, timezone=TZ)
 DAILY_ID = "skland_auto_arkgacha_daily"
 WORKER_ID = "skland_auto_arkgacha_worker"
 SEEN_ID = "skland_auto_arkgacha_seen"
@@ -372,11 +372,15 @@ async def _pull(role, grant: str) -> dict[tuple[int, int], dict]:
 
 
 async def _save(owner_id: int, role, records: dict) -> int | str:
-    """写入还没有的记录，返回新增的条数；拉取期间解绑或换了账号时什么都不写，返回原因。"""
+    """写入还没有的记录，返回新增的条数；拉取期间解绑或换了账号时什么都不写，返回原因。被判死锁时整个重来。"""
+    return await retry_deadlock(functools.partial(_save_once, owner_id, role, records))
+
+
+async def _save_once(owner_id: int, role, records: dict) -> int | str:
     async with get_session() as session:
-        await session.execute(text("BEGIN IMMEDIATE"))  # 防止与另一次同步、解绑和重新绑定冲突
+        await begin_write(session)  # 防止与另一次同步、解绑和重新绑定冲突
         current = (await session.execute(
-            select(SkUser.owner_id, SkUser.access_token, Character.app_code).join(Character.account).where(Character.id == role.id))).first()
+            select(SkUser.owner_id, SkUser.access_token, Character.app_code).join(Character.account).where(Character.id == role.id).with_for_update())).first()
         if current is None:
             return "unbound"
         if tuple(current) != (owner_id, role.access_token, "arknights"):
@@ -395,9 +399,10 @@ async def insert_new(session, character_id: int, rows: Iterable[dict]) -> int:
     new = [row for row in rows if (row["gacha_ts"], row["pos"]) not in have]
     if not new:
         return 0
-    # 用表而不是 ORM 实体插入：批量执行时才有 rowcount
-    result = await session.execute(insert(GachaRecord.__table__).on_conflict_do_nothing(index_elements=["character_id", "gacha_ts", "pos"]), new)
-    return max(result.rowcount, 0)
+    # 用表而不是 ORM 实体一次批量插入；新增条数按 RETURNING 回来的行数算（PostgreSQL 上这种语句的 rowcount 是 -1）
+    table = GachaRecord.__table__
+    result = await session.execute(dialect_insert(session, table).on_conflict_do_nothing(index_elements=["character_id", "gacha_ts", "pos"]).returning(table.c.id), new)
+    return len(result.all())
 
 
 async def sync_user(owner_id: int) -> tuple[str, int]:

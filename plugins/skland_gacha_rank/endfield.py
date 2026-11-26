@@ -22,7 +22,7 @@ from .ranking import MIN_UP, Board, Shown
 
 WIDTH = 1000
 SNAPSHOT_VERSION = 3  # 计算方法变了就加一，这样之前保存的数字都不会再用
-BASIS = f"数据来自已保存的抽卡记录（每天 01:00 自动更新，不含免费十连和当前垫抽），至少出过 {MIN_UP} 个 UP 才参与排名"
+BASIS = f"数据来自已保存的抽卡记录（每天 00:30–01:30 自动更新，不含免费十连和当前垫抽），至少出过 {MIN_UP} 个 UP 才参与排名"
 
 
 @dataclass

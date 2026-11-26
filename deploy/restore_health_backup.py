@@ -1,6 +1,8 @@
 """把每周体检删掉的森空岛账号、角色和抽卡记录，从体检备份写回数据库。
 
-    .venv/bin/python deploy/restore_health_backup.py <备份文件> <数据库文件> [--apply]
+    .venv/bin/python deploy/restore_health_backup.py <备份文件> <数据库文件或 PostgreSQL 地址> [--apply]
+
+主库是 PostgreSQL 时第二个参数写地址，例如 postgresql:///bot?host=/var/run/postgresql（核对和写回期间锁住三张表，别人只能读）。
 
 备份文件是 backups/skland-health/ 下的 .jsonl（一行一次删除，见 plugins/skland_health/backup.py），或 .json（整个文件是一次删除）。
 不带 --apply 只核对、报数，什么都不写；带 --apply 时核对和写回在同一个事务里，有任何冲突就一行都不写。
@@ -23,6 +25,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sqlite3
 import sys
 from collections import Counter
@@ -40,6 +43,42 @@ NATURAL = {
 }
 PARENT = {"skland_characters": ("account_id", "skland_user"), "skland_gacha_record": ("character_id", "skland_characters")}
 BACK, THERE, CLASH = "写回", "已在库里", "冲突"
+
+
+class Postgres:
+    """psycopg 的连接套一层，让下面按 sqlite3 写的核对和写回原样能用：? 换成 %s，
+    PRAGMA table_info 换成查 information_schema；BEGIN IMMEDIATE 换成开事务后锁住三张表（别人只能读）。"""
+
+    def __init__(self, url: str) -> None:
+        import psycopg
+
+        self._db = psycopg.connect(url.replace("postgresql+psycopg:", "postgresql:", 1), autocommit=True)
+        self._idle = psycopg.pq.TransactionStatus.IDLE
+
+    def execute(self, sql: str, params=()):
+        if columns := re.fullmatch(r"PRAGMA table_info\((\w+)\)", sql):
+            return self._db.execute("SELECT ordinal_position, column_name FROM information_schema.columns "
+                                    "WHERE table_schema = current_schema() AND table_name = %s", (columns[1],))
+        if sql.startswith("PRAGMA"):
+            return None  # 外键在 PostgreSQL 上一直生效
+        if sql == "BEGIN IMMEDIATE":
+            self._db.execute("BEGIN")
+            return self._db.execute(f"LOCK TABLE {', '.join(backup.TABLES)} IN EXCLUSIVE MODE")
+        return self._db.execute(sql.replace("?", "%s"), params)
+
+    def advance_sequences(self) -> None:
+        """按原来的 id 写回之后，把每张表的 id 序列推到最大的 id 之后：不然新绑定拿到的 id 会撞上写回的行。"""
+        for table in backup.TABLES:
+            sequence = self._db.execute("SELECT pg_get_serial_sequence(%s, 'id')", (table,)).fetchone()[0]
+            if sequence:
+                self._db.execute(f"SELECT setval(%s, GREATEST((SELECT COALESCE(max(id), 1) FROM {table}), (SELECT last_value FROM {sequence})))", (sequence,))
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._db.info.transaction_status != self._idle
+
+    def close(self) -> None:
+        self._db.close()
 
 
 def read(path: Path) -> tuple[dict[str, list[dict]], int]:
@@ -72,7 +111,9 @@ def verdict(db: sqlite3.Connection, table: str, row: dict, settled: dict[str, di
     found = db.execute(f"SELECT {', '.join(keys)} FROM {table} WHERE id = ?", (row["id"],)).fetchone()
     if found is not None:
         return THERE if tuple(found) == natural else CLASH
-    taken = db.execute(f"SELECT 1 FROM {table} WHERE " + " AND ".join(f"{key} IS ?" for key in keys), natural).fetchone()
+    # = 和 IS NULL 分开写：PostgreSQL 的 IS NOT DISTINCT FROM 用不上索引，一百多万条记录每查一次要半秒多
+    where = " AND ".join(f"{key} = ?" if value is not None else f"{key} IS NULL" for key, value in zip(keys, natural))
+    taken = db.execute(f"SELECT 1 FROM {table} WHERE {where}", [value for value in natural if value is not None]).fetchone()
     return CLASH if taken else BACK
 
 
@@ -109,11 +150,12 @@ def write(db: sqlite3.Connection, todo: dict[str, list[dict]]) -> None:
 def main(argv: list[str]) -> int:
     apply = "--apply" in argv
     args = [arg for arg in argv if arg != "--apply"]
-    if len(args) != 2 or not Path(args[0]).is_file() or not Path(args[1]).is_file():
+    postgres = len(args) == 2 and args[1].startswith("postgresql")
+    if len(args) != 2 or not Path(args[0]).is_file() or not (postgres or Path(args[1]).is_file()):
         print(__doc__)
         return 2
     rows, unreadable = read(Path(args[0]))
-    db = sqlite3.connect(Path(args[1]).resolve().as_uri() + "?mode=rw", uri=True, isolation_level=None, timeout=30)
+    db = Postgres(args[1]) if postgres else sqlite3.connect(Path(args[1]).resolve().as_uri() + "?mode=rw", uri=True, isolation_level=None, timeout=30)
     try:
         db.execute("PRAGMA foreign_keys = ON")
         db.execute("BEGIN IMMEDIATE" if apply else "BEGIN")  # 核对到写回之间，库不能被别人改
@@ -135,6 +177,8 @@ def main(argv: list[str]) -> int:
                 print("只核对，没有写。确认无误后加 --apply 写回")
                 return 0
             write(db, todo)
+            if postgres:
+                db.advance_sequences()
             db.execute("COMMIT")
             print(f"已写回 {sum(len(rows) for rows in todo.values())} 行")
             return 0

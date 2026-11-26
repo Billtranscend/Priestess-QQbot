@@ -13,7 +13,7 @@
                           （/zmd持有率 和 /榜单角色出场率 是它的别名）
 
 关卡数据来自 endfield_wiki 的 AKEData 索引；通关记录和编队来自群友的森空岛战争回响记录
-（每天采集两次）。
+（每晚和配装一起采集一次）。
 游戏内的关卡顺序和丰碑封面也来自森空岛（见 stages.py）。
 """
 
@@ -598,7 +598,7 @@ table.stats tr.hd td.g { border-left: 1px solid var(--ef-line); }
 
 BOARD_WIDTH = 1000
 ENDMIN_IDS = {"chr_0003_endminf": "chr_0002_endminm", "chr_9000_endmin": "chr_0002_endminm"}
-BOARD_FOOT = "用时与阵容来自森空岛最佳记录，精确到秒；阵容数字为 等级·潜能。数据每天 05:30、17:30 起陆续更新<br>不想上榜可发 /攻略统计 退出"
+BOARD_FOOT = "用时与阵容来自森空岛最佳记录，精确到秒；阵容数字为 等级·潜能。数据每天 00:30–01:30 更新<br>不想上榜可发 /攻略统计 退出"
 
 
 def _rank(n: int) -> str:
@@ -788,7 +788,7 @@ STATS_USAGE = "用法：/干员统计 [关卡名 | 战争回响 | 影拓丰碑]"
 STATS_FOOT = (
     f"持有率 = 持有该干员的角色数 ÷ 已统计角色数；绑定的所有森空岛账号和角色都计入，一人多号算多个，权限等级 {HOLDING_MIN_LEVEL} 级起；平均潜能只算持有者，范围 0–5<br>"
     "出场率 = 带该干员的通关记录数 ÷ 通关记录总数，每条记录为一位玩家在一关的最快编队；可加 关卡名 / 战争回响 / 影拓丰碑 只看这部分关卡；出场率的条以第一名为满格<br>"
-    "只代表绑定了机器人的玩家；持有率每天 03:00 更新，出场率每天 05:30、17:30 起陆续更新；不想参与可发送 /攻略统计 退出"
+    "只代表绑定了机器人的玩家；持有率和出场率每天 00:30–01:30 更新；不想参与可发送 /攻略统计 退出"
 )
 
 
@@ -876,28 +876,13 @@ async def _(arg: Message = CommandArg()) -> None:
 # ── 定时采集 ───────────────────────────────────────────────────────────
 
 
-@scheduler.scheduled_job("cron", hour="5,17", minute=30, timezone="Asia/Shanghai", id="endfield_guide_collect", misfire_grace_time=3600)
+@scheduler.scheduled_job("cron", hour=1, minute=0, timezone="Asia/Shanghai", id="endfield_guide_collect", misfire_grace_time=3600)
 async def _collect() -> None:
-    """通关记录每天采集两次；干员配装有单独的夜间任务（只有还没有配装数据或数据过时时，才在这里一起采集）。"""
-    started = time.time()
-    with_builds = not build_store.current()
-    try:
-        stats = await echo_store.collect(build_store if with_builds else None)
-        logger.info(f"War Echoes clears collected in {time.time() - started:.0f}s: {stats}")
-    except Exception as e:
-        logger.warning(f"War Echoes collection failed: {type(e).__name__}")
+    """每晚一趟，抽卡同步开始半小时后：通关记录和干员配装一起采集，每人只刷新一次令牌。那时明日方舟的同步
+    已经做完，同时问森空岛的不超过两个任务、10 个 worker（和以前两款抽卡同步一起跑时一样）。"""
+    with contextlib.suppress(Exception):  # 开始、结束和失败的日志由 collect 自己记
+        await echo_store.collect(build_store)
     await _warm_covers()
-
-
-@scheduler.scheduled_job("cron", hour=3, minute=0, timezone="Asia/Shanghai", id="endfield_guide_builds", misfire_grace_time=3600)
-async def _collect_builds() -> None:
-    """干员配装每晚采集一次，与通关记录分开，免得拖慢 05:30 的榜单更新。"""
-    started = time.time()
-    try:
-        stats = await echo_store.collect(build_store, clears=False)
-        logger.info(f"Operator builds collected in {time.time() - started:.0f}s: {stats}")
-    except Exception as e:
-        logger.warning(f"Operator builds collection failed: {type(e).__name__}")
 
 
 async def _warm_covers() -> None:

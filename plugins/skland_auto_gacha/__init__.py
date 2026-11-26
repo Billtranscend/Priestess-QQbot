@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 import hashlib
 from datetime import datetime, timezone
@@ -16,7 +17,6 @@ from nonebot import get_driver, logger, require
 from nonebot.plugin import PluginMetadata
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import event, select, update
-from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
 require("nonebot_plugin_skland")
@@ -31,9 +31,10 @@ from nonebot_plugin_skland.services import binding
 from nonebot_plugin_skland.services.gacha import get_all_ef_gacha_records
 
 
+from plugins.shared import begin_write, dialect_insert, retry_deadlock
 from plugins.skland_away import paused_owners
 
-from .core import Queue, TZ, login_expired, record_values, weekly_turn
+from .core import DAY_STARTS, Queue, TZ, login_expired, record_values, weekly_turn
 
 # 抽卡记录 API 每页 5 行，最新的在前。每晚把每个成员的全部记录读一遍，成员多时
 # 要十万次以上请求、8 小时以上，而新增的抽卡只有几百次。所以每个卡池从最新一页
@@ -73,7 +74,7 @@ async def new_ef_gacha_records(pool, server_id: str, role_token: str, known: set
         seq_id = following
 
 __plugin_meta__ = PluginMetadata(
-    name="Skland auto Endfield gacha sync", description="终末地抽卡记录：绑定后同步一次，之后每天北京时间 01:00 更新。",
+    name="Skland auto Endfield gacha sync", description="终末地抽卡记录：绑定后同步一次，之后每天北京时间 00:30 起更新。",
     usage="无指令，自动生效；/zmd抽卡记录 查看，/zmd抽卡记录更新 手动拉取。", type="application",
 )
 
@@ -81,7 +82,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "data/skland_auto_gacha/queue.sqlite3"
 DAILY_ID = "skland_auto_efgacha_daily_v1"
 WORKER_ID = "skland_auto_efgacha_worker_v1"
-TRIGGER = CronTrigger(hour=1, minute=0, second=0, timezone=TZ)
+TRIGGER = CronTrigger(hour=DAY_STARTS[0], minute=DAY_STARTS[1], second=0, timezone=TZ)
 POOL_TYPES = tuple(EndfieldPoolType)  # 官方 API 保存记录的每一种卡池（含重构寻访）
 _queue: Queue | None = None
 _busy = asyncio.Lock()
@@ -92,6 +93,7 @@ _stopping = False
 # 编写本插件时所依据的上游源码。
 _HASHES = {
     "services/binding.py": "846e7b85cc5aa66105542a8fe87934762db6fb2a5991f48a2f08109684c7cea8",  # skland_bind_sign 替换其中的 commit_account_binding
+    "account.py": "7a59c624c0b9d9b570d998fab6e483ec905fe37b25db9a7e86ccd3fa81be3cd1",  # skland_health 复用其中的同步角色和默认角色
     "services/gacha.py": "cb6ddcc782860b3a1d170adb9f2f17cfc082964d3c8997925b7b34918b441fce",
     "model.py": "94ec29e96e1855101b15cff39b0cd0f1ebd1cc7b8b2b0259e29b7a19ff50c370",
     "api/login.py": "fd35e3557de88bdb932ae71d9f37925489016e3535d2d273563bd798f0a12dc3",
@@ -171,29 +173,10 @@ async def sync_user(owner_id: int) -> tuple[str, int]:
             errors.append(exc)
             logger.warning("auto-efgacha role_failed error_type={} said={}", type(exc).__name__, re.sub(r"\d{5,}", "<id>", str(exc))[:80])  # 号码不进日志
             continue
-        async with get_session() as session:
-            # 让这次短暂的保存与手动 -u/解绑/重新绑定的事务排队串行。
-            from sqlalchemy import text
-            await session.execute(text("BEGIN IMMEDIATE"))
-            current = (await session.execute(
-                select(SkUser.owner_id, SkUser.access_token, Character.app_code, Character.role_id, Character.channel_master_id)
-                .join(Character.account).where(Character.id == role.id))).first()
-            if current is None:
-                return "unbound", total
-            if (current.owner_id, current.access_token, current.app_code, current.role_id, current.channel_master_id) != (
-                owner_id, token, "endfield", role.role_id, role.channel_master_id
-            ):
-                return "binding_changed", total
-            for values in records.values():
-                statement = insert(GachaRecord).values(**values).on_conflict_do_nothing(
-                    index_elements=["character_id", "gacha_ts", "pos"])
-                result = await session.execute(statement)
-                total += max(result.rowcount, 0)
-                if result.rowcount <= 0 and values["pool_version"] is not None:  # 升级前存下的行补上卡池期次
-                    await session.execute(update(GachaRecord).where(
-                        GachaRecord.character_id == values["character_id"], GachaRecord.gacha_ts == values["gacha_ts"],
-                        GachaRecord.pos == values["pos"], GachaRecord.pool_version.is_(None)).values(pool_version=values["pool_version"]))
-            await session.commit()
+        added = await retry_deadlock(functools.partial(_save_role, owner_id, role, token, records))
+        if isinstance(added, str):
+            return added, total
+        total += added
         synced += 1
     if not synced:
         raise next((e for e in errors if not login_expired(e)), errors[0])
@@ -238,6 +221,34 @@ def _skip_saved_records(session, flush_context, instances) -> None:
             session.expunge(record)
         if duplicates:
             logger.info("auto-efgacha manual_overlap skipped={} kept={}", len(duplicates), len(records) - len(duplicates))
+
+
+async def _save_role(owner_id: int, role, token: str, records: dict) -> int | str:
+    """保存一个角色拉到的记录，返回新增条数；拉取期间解绑或换了绑定时什么都不写，返回原因。"""
+    async with get_session() as session:
+        await begin_write(session)  # 这次短暂的保存与手动 -u/解绑/重新绑定的事务排队串行
+        current = (await session.execute(
+            select(SkUser.owner_id, SkUser.access_token, Character.app_code, Character.role_id, Character.channel_master_id)
+            .join(Character.account).where(Character.id == role.id).with_for_update())).first()
+        if current is None:
+            return "unbound"
+        if (current.owner_id, current.access_token, current.app_code, current.role_id, current.channel_master_id) != (
+            owner_id, token, "endfield", role.role_id, role.channel_master_id
+        ):
+            return "binding_changed"
+        total = 0
+        for values in records.values():
+            # 按 RETURNING 回来的行数算新增：PostgreSQL 上这种语句的 rowcount 是 -1
+            statement = dialect_insert(session, GachaRecord).values(**values).on_conflict_do_nothing(
+                index_elements=["character_id", "gacha_ts", "pos"]).returning(GachaRecord.id)
+            added = len((await session.execute(statement)).all())
+            total += added
+            if not added and values["pool_version"] is not None:  # 升级前存下的行补上卡池期次
+                await session.execute(update(GachaRecord).where(
+                    GachaRecord.character_id == values["character_id"], GachaRecord.gacha_ts == values["gacha_ts"],
+                    GachaRecord.pos == values["pos"], GachaRecord.pool_version.is_(None)).values(pool_version=values["pool_version"]))
+        await session.commit()
+    return total
 
 
 async def _tell_listeners(uid: int, status: str, records: int, final: bool) -> None:
@@ -333,7 +344,7 @@ async def start_auto_gacha():
                       max_instances=1, coalesce=True, misfire_grace_time=86400)
     scheduler.add_job(poll_queue, "interval", seconds=10, id=WORKER_ID,
                       replace_existing=True, max_instances=1, coalesce=True)
-    logger.info(f"auto-efgacha ready timezone=Asia/Shanghai daily=01:00 workers={WORKERS}")
+    logger.info(f"auto-efgacha ready timezone=Asia/Shanghai daily={DAY_STARTS[0]:02}:{DAY_STARTS[1]:02} workers={WORKERS}")
 
 
 @get_driver().on_shutdown

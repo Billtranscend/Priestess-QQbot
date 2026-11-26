@@ -18,6 +18,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 from nonebot import get_driver, logger, on_command, on_message, require
 from nonebot.adapters.onebot.v11 import MessageEvent
@@ -56,6 +57,7 @@ IMAGE_DIR = DATA_DIR / "img"
 ALIASES_FILE = Path(__file__).with_name("aliases.json")
 GOAL_RETRY_SECONDS = 6 * 3600
 SYNC_MINUTES = 10  # 只是一个小请求；游戏更新日新数据通常在北京时间 06:00-07:00 左右出现
+NOTICE_HOURS = 24  # 更新通知记下后最多补发这么久；之后还没发成的群不再发
 WHO = "Endfield wiki"  # 私聊超级用户失败时写日志用
 MANIFEST_FAILURES_BEFORE_ALERT = 3  # 数据站点暂时连不上不值得发消息
 NOTIFY_GAP = 3.0
@@ -235,12 +237,16 @@ async def _(state: T_State) -> None:
 # ── 数据同步和更新通知 ─────────────────────────────────────────────────
 
 
-async def _notify_all_groups(version: dict, previous: str, new_names: dict[str, list[str]]) -> bool:
+async def _notify_all_groups(
+    version: dict, previous: str, new_names: dict[str, list[str]], done: list[int] | None = None, saved: Callable[[], None] = lambda: None
+) -> bool:
     """新数据一进索引就发送，不管几点（数据都是一大早出来的）。发完了（或者不用发）时返回 True；
-    机器人不在线、群列表读不到、一个群都没发出去时返回 False，下一轮同步再发。
+    机器人不在线、群列表读不到、或者有群发送失败而这一轮一个群都没送达时返回 False，下一轮同步再发。
 
     只在版本新增了干员或武器时才发：只新增套装或关卡，
     或只改了数值和文字的版本，照常收录，但不在群里通知。
+
+    done 里的群（重启前已经发过或拒收过）跳过；送达或拒收的群随即加进 done，再调用 saved 记下来。
     """
     if not (new_names.get("干员") or new_names.get("武器")):
         logger.info(f"Endfield wiki: {version['id']} adds no operator or weapon, no group notice")
@@ -256,23 +262,56 @@ async def _notify_all_groups(version: dict, previous: str, new_names: dict[str, 
     except Exception as e:
         logger.warning(f"Endfield wiki: group list not read ({type(e).__name__}), update notice postponed")
         return False
-    sent = refused = 0
-    for group in groups:
+    done = [] if done is None else done
+    skip = set(done)
+    left = [group for group in groups if group["group_id"] not in skip]
+    logger.info(f"Endfield wiki update notice started for {version['id']}: {len(left)} of {len(groups)} groups to go")
+    outcomes = {"sent": 0, "refused": 0, "failed": 0}
+    for group in left:
+        outcome = await _send_notice(bot, group["group_id"], message)
+        outcomes[outcome] += 1
+        if outcome != "failed":  # 发送失败的群不记，下一轮只给它们补发
+            done.append(group["group_id"])
+            saved()
+        if outcome != "refused":  # 被拒的群什么也没收到，不用为它等发送间隔
+            await asyncio.sleep(NOTIFY_GAP)
+    logger.info(f"Endfield wiki update notice sent to {outcomes['sent']} of {len(groups)} groups "
+                f"({outcomes['refused']} do not take pushes, {outcomes['failed']} failed)")
+    return bool(outcomes["sent"]) or not outcomes["failed"]
+
+
+async def _send_notice(bot, group_id: int, message: str) -> str:
+    """给一个群发更新通知："sent"；群不让机器人主动发言 "refused"；失败了隔一会再试一次还不行 "failed"。"""
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(NOTIFY_GAP)
         try:
-            await (first_bot() or bot).send_group_msg(group_id=group["group_id"], message=message)  # 发送期间连接可能已经重建
-            sent += 1
+            await (first_bot() or bot).send_group_msg(group_id=group_id, message=message)  # 发送期间连接可能已经重建
+            return "sent"
         except Exception as e:
             if unprompted_refused(e):
-                refused += 1
-                continue  # 被拒的群什么也没收到，不用为它等发送间隔
+                return "refused"
             logger.warning(f"Endfield wiki notice failed for one group: {type(e).__name__}")
-        await asyncio.sleep(NOTIFY_GAP)
-    logger.info(f"Endfield wiki update notice sent to {sent} of {len(groups)} groups ({refused} do not take pushes)")
-    return bool(sent or refused) or not groups
+    return "failed"
+
+
+def _same_notice(stored: dict | None, pending: dict) -> bool:
+    """是不是同一条通知（不看发送进度 done 和开始补发的时间 since）。"""
+    return ({k: v for k, v in (stored or {}).items() if k not in ("done", "since")}
+            == {k: v for k, v in pending.items() if k not in ("done", "since")})
+
+
+def _save_done(pending: dict) -> None:
+    """把已经发过的群写进 state 里的这条通知；那里已经换成新版本的通知时不写。"""
+    state = _read_json(STATE_FILE, {})
+    if _same_notice(state.get("pending_notice"), pending):
+        state["pending_notice"] = pending
+        write_json(STATE_FILE, state)
 
 
 async def _deliver_pending() -> None:
-    """state 里还没发出去的更新通知（版本收录之后才记下的），发出去后删掉。已经在发的时候直接跳过。"""
+    """state 里还没发出去的更新通知（版本收录之后才记下的），发出去后删掉。已经在发的时候直接跳过；
+    重启前发了一半的，只发给还没发过的群。"""
     if _notice_lock.locked():
         return
     async with _notice_lock:
@@ -280,19 +319,31 @@ async def _deliver_pending() -> None:
         pending = state.get("pending_notice")
         if not pending:
             return
-        if await _notify_all_groups(pending["version"], pending["previous"], pending["new_names"]):
+        done = pending.setdefault("done", [])
+        if "since" not in pending:
+            pending["since"] = time.time()
+            _save_done(pending)
+        expired = time.time() - pending["since"] > NOTICE_HOURS * 3600
+        if expired and first_bot() is None:
+            return  # 放弃要私聊超级用户：机器人回来后的那一轮再放弃
+        if expired:
+            logger.warning(f"Endfield wiki: update notice for {pending['version'].get('id')} given up after {NOTICE_HOURS} h, {len(done)} groups done")
+            await tell_superusers(f"终末地资料库的更新通知补发了 {NOTICE_HOURS} 小时还有群没发出去，不再重试", WHO)
+        if expired or await _notify_all_groups(pending["version"], pending["previous"], pending["new_names"], done, lambda: _save_done(pending)):
             async with _sync_lock:
                 state = _read_json(STATE_FILE, {})
-                if state.get("pending_notice") == pending:
+                if _same_notice(state.get("pending_notice"), pending):
                     state.pop("pending_notice")
                     write_json(STATE_FILE, state)
 
 
 async def sync(force: bool = False) -> str:
-    """检查并收录新版本；之后把还没发出去的更新通知发掉（上一轮没发成的也在这时补发）。"""
-    result = await _sync(force)
-    await _deliver_pending()
-    return result
+    """检查并收录新版本；之后把还没发出去的更新通知发掉（上一轮没发成的也在这时补发）。
+    收录失败（AKEData 连不上）时也照样补发：补发的期限才是按真正跑过的轮次算的。"""
+    try:
+        return await _sync(force)
+    finally:
+        await _deliver_pending()
 
 
 async def _sync(force: bool) -> str:
@@ -335,9 +386,9 @@ async def _sync(force: bool) -> str:
         unseen = [item for item in found if item not in set(state.get("problems", []))]
         saved = {"version": latest["id"], "published": latest.get("publishedAt", ""), "synced_at": time.time(), "problems": found}
         if previous and previous != latest["id"]:  # 通知先记下来，发出去之后才删：发送失败也不会丢
-            saved["pending_notice"] = {"version": latest, "previous": previous, "new_names": changes.added(old_index, new_index)}
-        elif state.get("pending_notice"):
-            saved["pending_notice"] = state["pending_notice"]
+            saved["pending_notice"] = {"version": latest, "previous": previous, "new_names": changes.added(old_index, new_index), "since": time.time()}
+        elif pending := _read_json(STATE_FILE, {}).get("pending_notice"):  # 重读：重建期间群发可能又记下了几个发过的群
+            saved["pending_notice"] = pending
         write_json(STATE_FILE, saved)
         _failures["building"] = None  # 新版本已经收录：之后再出错（例如发通知）不是“没能重建”
         logger.info(f"Endfield wiki index built for {latest['id']}: {counts}")

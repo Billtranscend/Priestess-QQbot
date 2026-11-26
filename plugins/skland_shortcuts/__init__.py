@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import shelve
@@ -510,11 +509,11 @@ sign_status = on_command("签到详情", rule=strict, priority=5, block=True)
 
 @sign_all.handle()
 async def _(bot: OneBotV11Bot, user_session: UserSession, session: async_scoped_session) -> None:
-    """两个游戏同时签，用每晚签到那一套（plugins/skland_health：几个账号并行、签完一个保存一个、
-    等重新绑定和疑似已离开的成员不签），签完回复两份签到结果。"""
+    """两个游戏一轮签完，就是每晚签到那一套（plugins/skland_health：几个账号并行、每个账号先方舟后终末地、
+    签完一个保存一个、等重新绑定和疑似已离开的成员不签），签完回复两份签到结果。"""
     from plugins import skland_health  # 在本插件之后加载
 
-    await asyncio.gather(skland_health.run_daily_sign("arknights"), skland_health.run_daily_sign("endfield"))
+    await skland_health.run_daily_sign()
     await arksign_status_handler(user_session, session, bot, True, is_superuser=True)
     await ef_sign_status_handler(user_session, session, bot, True, is_superuser=True)
 

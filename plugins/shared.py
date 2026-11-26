@@ -6,11 +6,13 @@
 - bot_left_group：通知是“机器人自己不在这个群了”（被移出，或群已解散），各插件据此清掉该群的数据；
 - unprompted_refused：主动发到群里的消息被拒，因为这个群没开「机器人主动在群聊内发言」；
 - heybox_hint：抽卡记录页面上提醒成员可以从小黑盒补全更早的记录；
-- private_answer：群里的一条指令正把回复私聊发给本人（plugins/skland_bind_sign 设，skland_shortcuts 的发送钩子照着改发送对象）。
+- private_answer：群里的一条指令正把回复私聊发给本人（plugins/skland_bind_sign 设，skland_shortcuts 的发送钩子照着改发送对象）；
+- begin_write / dialect_insert：主库是 SQLite 还是 PostgreSQL 时各用各的写法。
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from contextvars import ContextVar
@@ -18,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from nonebot.adapters import Event
+from sqlalchemy import text
+from sqlalchemy.dialects import postgresql, sqlite
 
 
 private_answer: ContextVar[Any] = ContextVar("private_answer", default=None)  # 有 route(api, data) 方法的对象
@@ -26,6 +30,39 @@ private_answer: ContextVar[Any] = ContextVar("private_answer", default=None)  # 
 def bot_left_group(event: Event) -> bool:
     """群成员减少的通知里，离开的是机器人自己。"""
     return getattr(event, "notice_type", None) == "group_decrease" and str(getattr(event, "user_id", "")) == str(getattr(event, "self_id", None))
+
+
+
+async def begin_write(session) -> None:
+    """开始一次短写入，让它和同一成员的解绑、重新绑定排队。
+
+    SQLite 只能锁整个库（BEGIN IMMEDIATE）。PostgreSQL 这里什么都不做：调用方读要核对的行时加
+    with_for_update()，只锁这几行，别的成员照常写。SQLite 不认 FOR UPDATE，生成的语句里不会有它。
+    """
+    if session.bind.dialect.name == "sqlite":
+        await session.execute(text("BEGIN IMMEDIATE"))
+
+
+DEADLOCK = "40P01"  # PostgreSQL 判了死锁：两边各锁了对方要的行，它让其中一边整个事务作废
+
+
+async def retry_deadlock(write, tries: int = 3):
+    """跑一次写事务（write 是不带参数、每次新开会话的协程函数）；被 PostgreSQL 判了死锁就整个重来，最多 tries 次。
+    成员重新扫码、体检和同步保存恰好同时碰到同一个账号时会这样，几毫秒的事；SQLite 锁整个库，不会有。"""
+    from sqlalchemy.exc import DBAPIError
+
+    for attempt in range(tries):
+        try:
+            return await write()
+        except DBAPIError as e:
+            if attempt == tries - 1 or getattr(e.orig, "sqlstate", None) != DEADLOCK:
+                raise
+            await asyncio.sleep(0.2 * (attempt + 1))
+
+
+def dialect_insert(session, table):
+    """按主库选 INSERT 的写法，调用方接着写 .on_conflict_do_nothing(...)。"""
+    return (postgresql if session.bind.dialect.name == "postgresql" else sqlite).insert(table)
 
 
 UNPROMPTED_REFUSED = 40_034_105  # 官方平台：群里没开「机器人主动在群聊内发言」，重试也一样
@@ -59,19 +96,22 @@ def first_bot():
     return next((bot for bot in get_bots().values() if isinstance(bot, Bot)), None)
 
 
-async def tell_superusers(text: str, who: str) -> None:
-    """私聊发给每个超级用户，绝不发到群里；who 是写日志时的插件名。"""
+async def tell_superusers(text: str, who: str) -> bool:
+    """私聊发给每个超级用户，绝不发到群里；who 是写日志时的插件名。至少发到了一个人时返回 True。"""
     from nonebot import get_driver, logger
 
     bot = first_bot()
     if bot is None:
         logger.warning(f"{who}: no bot online, superusers not told")
-        return
+        return False
+    told = False
     for user_id in get_driver().config.superusers:
         try:
             await bot.send_private_msg(user_id=int(user_id), message=text)
+            told = True
         except Exception as e:
             logger.warning(f"{who}: a superuser could not be told ({type(e).__name__})")
+    return told
 
 
 HEYBOX_IMPORT = "/导入小黑盒 小黑盒ID"  # 一次补两款游戏
