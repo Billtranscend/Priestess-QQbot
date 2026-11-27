@@ -63,7 +63,8 @@ plugins/
   endfield_guide/              高难关卡资料、竞速榜、干员统计
   endfield_roster/             终末地角色卡（/zmd开盒）
   arknights_roster/            明日方舟角色卡（/mrfz开盒）
-  arknights_garrison/          卫戍协议战绩（/卫，数据用上游的 GarrisonView，图自己画）和卫戍榜（每天 10:30 统计，结果在 data/arknights_garrison/board.json）
+  arknights_garrison/          卫戍协议战绩（/卫，数据用上游的 GarrisonView，读到的对局存进 history.sqlite3 按整个赛季统计，图自己画）
+                               和卫戍榜（每天 10:30 统计，结果在 data/arknights_garrison/board.json）
   skland_gacha_rank/           两款游戏的欧非榜（全部绑定用户一起排名，统计结果缓存在 data/skland_gacha_rank/ 下的 snapshot.json 和 arknights_snapshot.json）
   heybox_import/               从小黑盒导入早期抽卡记录
   weekly_report/               本周任务（/本周任务，发指令时生成）

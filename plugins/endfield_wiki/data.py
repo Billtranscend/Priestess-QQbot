@@ -75,7 +75,7 @@ TABLES = (
     "ActivityWeeklyTaskTable",
     "ActivityWeeklyTaskMileStoneTable",
 )
-INDEX_SCHEMA = 27  # 索引结构变化时加一以强制重建（27：复刻武器池沿用其角色池的时间窗口，link；26：常驻活动的新关卡；25：活动结束时间取游戏内日历的关卡，shop_close；18：领袖敌人，19：后勤技能，20：散件装备，21：卡池，22：增辉条件，23：游戏富文本颜色和术语图标，24：来自 HyperlinkTextTable 的 <#term> 样式）
+INDEX_SCHEMA = 28  # 索引结构变化时加一以强制重建（28：分级的影拓丰碑，同名系列合成一个丰碑、每关按级排列；27：复刻武器池沿用其角色池的时间窗口，link；26：常驻活动的新关卡；25：活动结束时间取游戏内日历的关卡，shop_close；18：领袖敌人，19：后勤技能，20：散件装备，21：卡池，22：增辉条件，23：游戏富文本颜色和术语图标，24：来自 HyperlinkTextTable 的 <#term> 样式）
 EXTRA_GOAL_FILES = ("GameplayConfig/SubGameInstanceDataTable.json", "GameplayConfig/ScriptTaskExtraInfoTable.json")
 # 卡池表的 `type` -> nonebot-plugin-skland 的 pool_type。新手 (1) 和 常驻 (2) 不收录，与它自己的表一致。
 CHAR_POOL_TYPES = {0: "special", 3: "extra", 4: "rerun"}
@@ -122,6 +122,69 @@ async def download_tables(client: httpx.AsyncClient, table_path: str, target: Pa
     response.raise_for_status()
     (target / "maps.json").write_bytes(response.content)
     await download_stage_data(client, target)
+
+
+TIERS = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"  # 分级丰碑的级别，写在关卡名末尾
+TIER = re.compile(f"([{TIERS}])$")
+
+
+def split_stage_name(name: str) -> tuple[str, str]:
+    """游戏的关卡名 -> (关卡, 级别)。
+
+    分级的丰碑写成「凶行揭明·三位一体Ⅷ」：关卡是带级别的那一段去掉级别，即「三位一体」。
+    其他关卡名「·」后面是难度之类的后缀（森空岛的「关一·苦难」），关卡取第一段，级别为空。
+    """
+    parts = [part.strip() for part in name.split("·")]
+    for i, part in enumerate(parts):
+        if tier := TIER.search(part):
+            return part[: tier.start()].strip() or (parts[i - 1] if i else ""), tier.group(1)
+    return parts[0], ""
+
+
+def build_monument(series: dict, dungeons: dict, text, stage) -> list[dict]:
+    """影拓丰碑：按 sortId 排列的丰碑，各自的关卡和难度。
+
+    以前每关分普通、苦难（`_s`）；分级的丰碑每关有若干级（同一关卡名、不同级别的几个关卡 id），
+    而且一个丰碑的几关登记成几个同名系列，这里合回一个丰碑。
+    """
+    monument: list[dict] = []
+    for series_id, row in sorted(series.items(), key=lambda kv: kv[1].get("sortId", 0)):
+        if row.get("gameCategory") != "dungeon_highdifficulty":
+            continue
+        name, stage_ids = text(row.get("name")), row.get("includeDungeonIds", [])
+        groups: list[dict] = []
+        tiered: dict[str, dict] = {}  # 关卡名 -> 它的关卡组
+        for base in [sid for sid in stage_ids if not sid.endswith("_s")]:
+            dungeon = dungeons.get(base, {})
+            stage_name, tier = split_stage_name(text(dungeon.get("dungeonName")))
+            if tier and stage_name in tiered:
+                tiered[stage_name]["stages"].append(stage(base, tier))
+                continue
+            group = {"id": base, "name": stage_name, "mode": "影拓丰碑", "series": name, "cover": dungeon.get("dungeonPicPath", "")}
+            if tier:
+                group.update(tiered=True, stages=[stage(base, tier)])
+                tiered[stage_name] = group
+            else:
+                group["stages"] = [stage(base, "普通")] + ([stage(base + "_s", "苦难")] if base + "_s" in stage_ids else [])
+            groups.append(group)
+        same = next((entry for entry in monument if entry["name"] == name), None)
+        if same:
+            _merge_groups(same["groups"], groups)
+        else:
+            monument.append({"id": series_id, "name": name, "groups": groups})
+    for group in (g for entry in monument for g in entry["groups"] if g.get("tiered")):
+        group["stages"].sort(key=lambda s: TIERS.index(s["difficulty"]))
+    return monument
+
+
+def _merge_groups(into: list[dict], groups: list[dict]) -> None:
+    """同名系列的关卡并进来：同名的分级关卡接上它的级别，其他同名关卡（例如复刻）只留第一个。"""
+    for group in groups:
+        same = next((g for g in into if g["name"] == group["name"]), None)
+        if same is None:
+            into.append(group)
+        elif same.get("tiered") and group.get("tiered"):
+            same["stages"] += group["stages"]
 
 
 def endgame_stage_ids(series: dict, tower_groups: dict) -> list[str]:
@@ -793,27 +856,7 @@ def build_endgame(load, text, maps: dict, table_dir: Path) -> dict:
             )
         seasons.append({"id": int(season_id), "name": text(season.get("name")), "weeks": weeks})
 
-    monument = []
-    for series_id, row in sorted(series.items(), key=lambda kv: kv[1].get("sortId", 0)):
-        if row.get("gameCategory") != "dungeon_highdifficulty":
-            continue
-        stage_ids = row.get("includeDungeonIds", [])
-        groups = []
-        for base in [sid for sid in stage_ids if not sid.endswith("_s")]:
-            variants = [stage(base, "普通")] + ([stage(base + "_s", "苦难")] if base + "_s" in stage_ids else [])
-            groups.append(
-                {
-                    "id": base,
-                    "name": base_name(base),
-                    "mode": "影拓丰碑",
-                    "series": text(row.get("name")),
-                    "cover": dungeons.get(base, {}).get("dungeonPicPath", ""),
-                    "stages": variants,
-                }
-            )
-        monument.append({"id": series_id, "name": text(row.get("name")), "groups": groups})
-
-    return {"tower": tower, "tower_seasons": seasons, "monument": monument}
+    return {"tower": tower, "tower_seasons": seasons, "monument": build_monument(series, dungeons, text, stage)}
 
 
 def _blackboard(rows: list | None) -> dict[str, float]:

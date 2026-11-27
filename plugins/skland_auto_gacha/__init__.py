@@ -41,7 +41,7 @@ from .core import DAY_STARTS, Queue, TZ, login_expired, record_values, weekly_tu
 # 往回读，读到第一条已存的记录为止。一个角色的记录在所有卡池都读完后一次性保存，所以存下的
 # 始终是从最新往旧、连续完整的一段。
 # 兜底：每个成员每周有一天（weekly_turn）完整读一遍，读到的超出最新那一段的记录记为 `missed`。
-WORKERS = 5  # 同时同步的成员数，与竞速榜采集相同
+WORKERS = 10  # 同时同步的成员数：10 个时森空岛没有变慢，和明日方舟同步、竞速榜采集三项同时开也没有限流
 REQUEST_GAP = 2  # 同一个 worker 两个成员之间的秒数
 
 

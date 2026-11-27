@@ -3,7 +3,9 @@
 数据用上游 nonebot-plugin-skland 的接口和 GarrisonView（雷达图、偏好、对局记录都由它算好）；战绩请求是上游 ark_garrison 的副本
 （_ask_garrison），没打过的角色一次请求就能认出；启动时比对，上游版本或 ark_garrison 变了、或它被别的插件包上时退回上游请求加补问。
 图由本插件按 /mrfz开盒 的明日方舟风格绘制，每个图标都写上名字和数字（render.py）。
-资源表约 500 KB，在内存里缓存一天，战绩每次查询时现取。
+资源表约 500 KB，在内存里缓存一天，战绩每次查询时现取。森空岛只给最近 100 局：每次读到的对局摘要存进 HISTORY
+（season.py，一个 SQLite 库，长期保存），常用策略、常用盟约、Boss 击杀和游戏时长按本赛季记录到的对局算；每天统计卫戍榜后
+删掉不再绑定的角色的记录。
 
 /卫 的选项用中文：全部（全部记录）、收藏（收藏的对局）、详情 [第几局]（不带数字时列出各局供点选）。
 查自己时下面跟着这些选项的按钮。
@@ -75,6 +77,7 @@ from plugins.shared import write_json
 from plugins.skland_roles import member_numbers
 
 from . import render
+from .season import History, season_view
 from .stats import Standing, ranked, standing
 
 __plugin_meta__ = PluginMetadata(
@@ -87,9 +90,10 @@ __plugin_meta__ = PluginMetadata(
 RESOURCE_MAX_AGE = 86400  # 资源表缓存多久；换赛季后一天内用上新赛季
 BOARD_FILE = store.get_plugin_data_file("board.json")
 OPTOUT_FILE = store.get_plugin_data_file("optout.json")
+HISTORY = History(store.get_plugin_data_file("history.sqlite3"))  # 本赛季记录到的对局摘要
 RECOUNT_FILE = store.get_plugin_data_file("recount")  # 有这个文件时，启动后统计一次（统计开始前删掉）；内容为 multi 时只读多角色成员
 BOARD_VERSION = 1
-WORKERS = 5  # 每天统计时同时读取的成员数，与竞速榜采集相同
+WORKERS = 5  # 每天统计时同时读取的成员数
 COLLECT_PAUSE = 1.0  # 同一个 worker 两次读取之间的秒数
 DETAIL = re.compile(r"^(?:详情|第)\s*(\d+)?\s*局?$")
 PAGE = re.compile(r"^第\s*(\d+)\s*页$")
@@ -223,13 +227,16 @@ async def resources_for(user: SkUser) -> GarrisonResources:
 
 
 async def view_of(user: SkUser, character: Character, **choice) -> GarrisonView:
-    """取一个角色的战绩，交给上游的 GarrisonView 算好（choice：record_index / favored）。"""
+    """取一个角色的战绩，交给上游的 GarrisonView 算好（choice：record_index / favored），偏好等再换成按本赛季记录到的对局算的。"""
     res = await resources_for(user)
-    data = await _fetch_data(user, character.uid, res.current_activity_id)
-    return GarrisonView.from_data(
+    activity = res.current_activity_id
+    data = await _fetch_data(user, character.uid, activity)
+    records = HISTORY.remember(activity, str(character.uid), [*data.history.records, *data.history.favourRecords])
+    view = GarrisonView.from_data(
         data, res, uid=str(character.uid), server_name=character.server_name, channel_master_id=character.channel_master_id,
-        activity_id=res.current_activity_id, **choice,
+        activity_id=activity, **choice,
     )
+    return season_view(view, records, data.career, res, activity)
 
 
 def parse_choice(text: str) -> dict | str | None:
@@ -584,6 +591,20 @@ async def _collect(multi_only: bool) -> tuple[int, int]:
 async def _daily() -> None:
     with contextlib.suppress(Exception):  # 原因 collect 已记下
         await collect()
+    await prune_history()
+
+
+async def prune_history() -> None:
+    """删掉已经不绑定的明日方舟角色的对局记录（别的赛季的留着）。"""
+    try:
+        async with get_session() as session:
+            uids = set((await session.scalars(select(Character.uid).where(Character.app_code == "arknights"))).all())
+        removed = HISTORY.prune({str(uid) for uid in uids})
+    except Exception as e:
+        logger.warning(f"Arknights stronghold: season records not pruned ({type(e).__name__})")
+        return
+    if removed:
+        logger.info(f"Arknights stronghold: season records of {removed} roles removed")
 
 
 COLD_START_DELAY = 60  # 启动后多少秒补做第一次统计（还没有任何榜单时）

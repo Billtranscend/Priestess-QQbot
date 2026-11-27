@@ -28,6 +28,7 @@ from nonebot_plugin_user.models import Bind
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
+from plugins.endfield_wiki.data import split_stage_name
 from plugins.skland_away import paused_owners
 from plugins.skland_roles import default_role, member_roles, owner_id_of
 
@@ -38,7 +39,7 @@ WAR_ECHOES_URL = "https://zonai.skland.com/api/v1/game/endfield/card/war-echoes"
 INDIE_HARD_URL = "https://zonai.skland.com/api/v1/game/endfield/card/indie-hard"  # 影拓丰碑
 DIFFICULTY_FIELDS = (("normalDungeon", "普通"), ("hardDungeon", "困难"), ("cruelDungeon", "残酷"))
 REQUEST_GAP = 2.0  # 同一个 worker 两次请求之间的间隔
-WORKERS = 5  # 同时拉取的群友数；逐个拉取约 10 秒一人（392 人 67 分钟），3 个 worker 420 人约 21 分钟且没有多出错误
+WORKERS = 10  # 同时拉取的群友数：10 个时森空岛没有变慢，和两款抽卡同步三项同时开也没有限流
 SAVE_SECONDS = 300  # 采集中途隔多久保存一次通关记录：整份约 20 MB，每写一次要卡主线程约 0.3 秒
 COMMIT_TRIES = 4  # 保存 token 时数据库被别的写操作锁住：最多试几次
 SSL_CONTEXT = httpx.create_ssl_context()  # 所有请求共用：每个客户端现建一份证书配置要在主线程卡约 25 毫秒
@@ -218,7 +219,8 @@ class EchoStore:
         missed: set[str] = set()  # 这一轮没拉到通关记录的群友：上一轮的记录先留着，这一轮结束时再定
 
         async def worker() -> None:
-            # 每个 worker 一个 session：AsyncSession 不能被并发任务共用。
+            # 每个 worker 一个 session：AsyncSession 不能被并发任务共用。整轮都占着一条数据库连接，
+            # 所以连接池要比三项夜间任务的 worker 加起来还大（见 .env.prod 的 SQLALCHEMY_ENGINE_OPTIONS）
             nonlocal done, saved
             async with get_session(expire_on_commit=False, autoflush=False) as session:
                 while not queue.empty():
@@ -442,17 +444,37 @@ def _record(best: dict, plus: bool = False) -> dict:
     }
 
 
+_logged: set[str] = set()  # 已经记过的日志行：每次启动每种只记一次
+
+
+def _log_once(key: str, line: str) -> None:
+    if key not in _logged:
+        _logged.add(key)
+        logger.info(line)
+
+
 def _extract_monument(indie_hard: dict) -> dict:
-    """影拓丰碑的最佳通关记录，键为 "关卡|普通" / "关卡|苦难"。"""
+    """影拓丰碑的最佳通关记录，键为 "关卡|普通" / "关卡|苦难"；分级的丰碑是 "关卡|Ⅷ" 这样的级别。"""
     records = {}
     for series in indie_hard.get("indieHardGroups", []):
-        for group in series.get("dungeonGroups", []):
+        name = str(series.get("name", ""))
+        groups = [group for group in series.get("dungeonGroups") or [] if isinstance(group, dict)]
+        if not any(group.get("normalDungeon") or group.get("hardDungeon") for group in groups):  # 森空岛换了写法：记下字段名（只有游戏数据）
+            _log_once(f"shape:{name}", f"War Echoes: monument {name!r} has no readable stages; fields {sorted(series)}, first group {sorted(groups[0]) if groups else []}")
+        read: dict[str, str] = {}  # 记录键 -> 读出它的关卡名
+        for group in groups:
             for field, difficulty in (("normalDungeon", "普通"), ("hardDungeon", "苦难")):
                 dungeon = group.get(field) or {}
                 best = dungeon.get("bestRecord") or {}
+                raw = str(dungeon.get("name") or "")
+                stage, tier = split_stage_name(raw)
+                key = f"{stage}|{tier or difficulty}"
+                if raw and read.setdefault(key, raw) != raw:  # 两个关卡读成了同一个键：森空岛的级别写法和资料库不同
+                    _log_once(f"same:{name}|{key}", f"War Echoes: monument {name!r}: {read[key]!r} and {raw!r} are both read as {key!r}")
+                if tier:  # 分级的丰碑：每关记一次名字是怎么读的，好和资料库核对
+                    _log_once(f"tier:{name}|{stage}", f"War Echoes: tiered monument {name!r}: {raw!r} read as stage {stage!r}, level {tier!r}")
                 if dungeon.get("isPass") and best.get("chars"):
-                    name = dungeon.get("name", "").split("·")[0].strip()
-                    record, key = _record(best), f"{name}|{difficulty}"
+                    record = _record(best)
                     if _faster(record, records.get(key)):
                         records[key] = record
     return records
@@ -467,20 +489,28 @@ def extract_layout(indie_hard: dict) -> dict:
     def stamp(value) -> int:
         return int(value) if str(value or "").isdigit() else 0
 
-    monument = [
-        {
-            "name": series.get("name", ""),
-            "pic": series.get("pic", ""),
-            "stages": [
-                (group.get("normalDungeon") or group.get("hardDungeon") or {}).get("name", "").split("·")[0].strip()
-                for group in series.get("dungeonGroups", [])
-            ],
-            "activity": series.get("activityName", ""),
-            "open": stamp(series.get("activityStartTs")),
-            "close": stamp(series.get("activityEndTs")),
-        }
-        for series in indie_hard.get("indieHardGroups", [])
-    ]
+    monument: list[dict] = []
+    for series in indie_hard.get("indieHardGroups", []):
+        stages = [
+            split_stage_name(str((group.get("normalDungeon") or group.get("hardDungeon") or {}).get("name") or ""))[0]
+            for group in series.get("dungeonGroups") or []
+            if isinstance(group, dict)
+        ]
+        same = next((entry for entry in monument if entry["name"] == series.get("name", "")), None)
+        if same:  # 一个丰碑的几关登记成几个同名系列（暴君武装）
+            same["stages"] += [stage for stage in dict.fromkeys(stages) if stage not in same["stages"]]
+            same["pic"] = same["pic"] or series.get("pic", "")
+            continue
+        monument.append(
+            {
+                "name": series.get("name", ""),
+                "pic": series.get("pic", ""),
+                "stages": list(dict.fromkeys(stages)),  # 分级的丰碑每级一组，关卡名相同
+                "activity": series.get("activityName", ""),
+                "open": stamp(series.get("activityStartTs")),
+                "close": stamp(series.get("activityEndTs")),
+            }
+        )
     return {"monument": monument}
 
 

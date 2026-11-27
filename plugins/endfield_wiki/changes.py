@@ -10,13 +10,20 @@ import re
 LIST_LIMIT = 12  # 群通知里每行最多列出的名字数
 
 
+def _monument(series: dict) -> str:
+    """丰碑和它的关卡；分级的丰碑再说有几个难度：暴君武装（三位一体、聂菲斯，各 8 个难度）。"""
+    groups = series.get("groups", [])
+    counts = {len(group.get("stages", [])) for group in groups}
+    tiers = ""
+    if groups and all(group.get("tiered") for group in groups) and len(counts) == 1:
+        tiers = f"，{'各 ' if len(groups) > 1 else ''}{counts.pop()} 个难度"
+    return f'{series.get("name", "")}（{"、".join(group.get("name", "") for group in groups)}{tiers}）'
+
+
 def names(index: dict) -> dict[str, list[str]]:
     """类别 -> 名字，按索引自身的顺序。"""
     endgame = index.get("endgame") or {}
-    monuments = [
-        f'{series.get("name", "")}（{"、".join(group.get("name", "") for group in series.get("groups", []))}）'
-        for series in endgame.get("monument", [])
-    ]
+    monuments = [_monument(series) for series in endgame.get("monument", [])]
     return {
         "干员": [op.get("name", "") for op in (index.get("operators") or {}).values()],
         "武器": [weapon.get("name", "") for weapon in (index.get("weapons") or {}).values()],

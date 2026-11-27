@@ -112,6 +112,11 @@ def poster(series: dict) -> tuple[str, str, int]:
     return series.get("pic", ""), f"series_{series['id']}" if series.get("pic") else "", POSTER_WIDTH
 
 
+def stand_ins(series: dict) -> list[dict]:
+    """森空岛还没收录的丰碑没有封面：总览里用前两关的场景图代替。"""
+    return [] if series.get("pic") else [group for group in series["groups"] if group.get("cover")][:2]
+
+
 def stage_cover(group: dict, url: str) -> tuple[str, str, int]:
     return url, group.get("cover", ""), TOWER_WIDTH if group.get("mode") == "战争回响" else STAGE_WIDTH
 
@@ -139,6 +144,8 @@ body { width: %dpx; padding: 24px; }
 .card { background: var(--ef-panel); border: 1px solid var(--ef-line); border-bottom: 3px solid var(--ef-ink); }
 .card .art { position: relative; aspect-ratio: 4 / 5; background: var(--ef-dark); }
 .card .art img { display: block; width: 100%%; height: 100%%; object-fit: cover; }
+.card .art .duo { display: grid; grid-template-rows: 1fr 1fr; gap: 3px; height: 100%%; }
+.card .art .duo img { min-height: 0; }
 .card .art .tag { position: absolute; left: 0; top: 10px; padding: 2px 10px; font-size: 13px; font-weight: 700; background: var(--ef-yellow); color: var(--ef-ink); }
 .card h3 { padding: 10px 12px 8px; font-size: 21px; font-weight: 900; border-bottom: 2px solid var(--ef-ink); }
 .card ol { list-style: none; padding: 8px 12px 10px; }
@@ -241,7 +248,23 @@ def _stamp(ts: float, pattern: str = "%m/%d %H:%M") -> str:
 
 
 def _levels(group: dict) -> str:
-    return "".join(f'<span>{escape(s["difficulty"])} <i>Lv{s["recommend_lv"]}</i></span>' for s in group["stages"])
+    """各难度的推荐等级；分级的关卡把推荐等级相同的相邻几级写成一段（Ⅰ–Ⅲ Lv60）。"""
+    runs: list[list[dict]] = []
+    for stage in group["stages"]:
+        if group.get("tiered") and runs and runs[-1][-1]["recommend_lv"] == stage["recommend_lv"]:
+            runs[-1].append(stage)
+        else:
+            runs.append([stage])
+    spans = []
+    for run in runs:
+        label = run[0]["difficulty"] + (f"–{run[-1]['difficulty']}" if len(run) > 1 else "")
+        spans.append(f'<span>{escape(label)} <i>Lv{run[0]["recommend_lv"]}</i></span>')
+    return "".join(spans)
+
+
+def tiered(series: dict) -> bool:
+    """分级的丰碑：每关分 Ⅰ、Ⅱ……若干级，没有普通、苦难。"""
+    return any(group.get("tiered") for group in series["groups"])
 
 
 def _foes_line(group: dict, icons: dict[str, str]) -> str:
@@ -263,14 +286,21 @@ def _row(group: dict, number: int, covers: dict[str, str], icons: dict[str, str]
     )
 
 
+def _art(series: dict, covers: dict[str, str]) -> str:
+    """总览卡片上的封面；没有时用关卡场景图，两张就上下排。"""
+    if art := covers.get(poster(series)[1], ""):
+        return _img(art)
+    tiles = [_img(covers[group["cover"]]) for group in stand_ins(series) if group["cover"] in covers]
+    return f'<div class="duo">{"".join(tiles)}</div>' if len(tiles) > 1 else "".join(tiles)
+
+
 def overview_html(theme, monument: list[dict], covers: dict[str, str], now: float, version: str) -> str:
     cards = []
     for series in monument:
-        art = covers.get(poster(series)[1], "")
         tag = f'<span class="tag">活动中 · {_stamp(series["close"])} 截止</span>' if live(series, now) else ""
         stages = "".join(f'<li><span class="no">{g["no"]}</span>{escape(g["name"])}</li>' for g in series["groups"])
         cards.append(
-            f'<div class="card"><div class="art">{_img(art)}{tag}</div>'
+            f'<div class="card"><div class="art">{_art(series, covers)}{tag}</div>'
             f'<h3>{escape(series["name"])}</h3><ol>{stages}</ol></div>'
         )
     total = sum(len(s["groups"]) for s in monument)
@@ -294,14 +324,21 @@ def series_html(theme, series: dict, covers: dict[str, str], icons: dict[str, st
     if live(series, now):
         chips += f'<span class="live">{escape(series["activity"] or "活动")}进行中 · <i>{_stamp(series["close"])}</i> 截止</span>'
     rows = "".join(_row(g, g["no"], covers, icons, g["name"] == marked) for g in series["groups"])
-    side = f'<div class="poster">{_img(art)}<p>苦难模式全通<br>即可为<b>蚀刻章镀层</b></p></div>'
-    first = series["groups"][0]["name"] if series["groups"] else ""
+    first = series["groups"][0] if series["groups"] else {"name": "", "stages": []}
+    if tiered(series):  # 分级的丰碑没有苦难模式，镀层条件也还不知道
+        levels = f"{first['stages'][0]['difficulty']}–{first['stages'][-1]['difficulty']}" if first["stages"] else ""
+        side = f'<div class="poster">{_img(art)}<p>每关分<br><b>{levels}</b> {len(first["stages"])} 个难度</p></div>'
+        top, alt = f" {first['stages'][-1]['difficulty']} 难度", ""  # 关卡名可能也是领袖敌人的名字（三位一体）：只提丰碑名加序号
+        single = f"只看一个难度：/敌人 {escape(series['name'])} 1 {len(first['stages'])}级 · "
+    else:
+        side, top, single = f'<div class="poster">{_img(art)}<p>苦难模式全通<br>即可为<b>蚀刻章镀层</b></p></div>', "苦难模式", ""
+        alt = f"（或 /敌人 {escape(first['name'])}）"
     return _page(
         theme,
         theme.head("Arknights: Endfield · 影拓丰碑", escape(series["name"]), chips),
         f'<div class="split">{side}<div class="rows">{rows}</div></div>',
-        f"顺序与游戏内从上到下一致，图标为苦难模式的敌人 · 机制和敌人属性发 /敌人 {escape(series['name'])}（或 /敌人 {escape(first)}）<br>"
-        f"也可以用序号：/敌人 {escape(series['name'])} 1 · 本群用时排名发 /丰碑竞速 {escape(series['name'])} · 数据版本 {_version(version)}",
+        f"顺序与游戏内从上到下一致，图标为{top}的敌人 · 机制和敌人属性发 /敌人 {escape(series['name'])}{alt}<br>"
+        f"也可以用序号：/敌人 {escape(series['name'])} 1 · {single}本群用时排名发 /丰碑竞速 {escape(series['name'])} · 数据版本 {_version(version)}",
     )
 
 
@@ -327,11 +364,35 @@ def rotation_html(theme, season: dict, week: dict, groups: list[dict], upcoming:
     )
 
 
-def _mechanics(stages: list[dict]) -> str:
-    """各难度的关卡机制；文字相同的难度合用一块。"""
-    blocks: list[tuple[list[str], str]] = []
+def _lines(feature: str) -> list[str]:
+    return [line.strip() for line in feature.split("<br>") if line.strip()]
+
+
+def _added(stages: list[dict]) -> list[str] | None:
+    """每一级比上一级多出来的机制（第一级是全部）；不是这样逐级累加的（或有特殊增益）时为 None。"""
+    if any(stage.get("special_buff") for stage in stages):
+        return None
+    added, before = [], set()
     for stage in stages:
+        lines = _lines(stage.get("feature") or "")
+        if not before <= set(lines):
+            return None
+        added.append("<br>".join(line for line in lines if line not in before))
+        before = set(lines)
+    return added
+
+
+def _mechanics(stages: list[dict], stepwise: bool = False) -> str:
+    """各难度的关卡机制；文字相同的难度合用一块。
+
+    `stepwise`（分级的关卡，每升一级多几条机制）时第一级写全，之后每级只写多出来的，图短得多。
+    """
+    added = _added(stages) if stepwise and len(stages) > 1 else None
+    blocks: list[tuple[list[str], str]] = []
+    for no, stage in enumerate(stages):
         text = stage.get("feature") or '<span class="dim">无特殊机制说明</span>'
+        if added is not None and no:
+            text = f'<span class="dim">比上一级多：</span><br>{added[no]}' if added[no] else '<span class="dim">机制和上一级相同</span>'
         if stage.get("special_buff"):
             text += f'<div class="sb"><b>特殊增益</b>{stage["special_buff"]}</div>'
         if blocks and blocks[-1][1] == text:
@@ -353,7 +414,7 @@ def enemies_html(theme, kicker: str, title: str, chips: str, groups: list[dict],
     brief = len(groups) > 1 and difficulty is None
     for group in groups:
         stages = [s for s in group["stages"] if difficulty in (None, s["difficulty"])] or group["stages"]
-        mechanics = _mechanics(stages[-1:] if brief else stages)
+        mechanics = _mechanics(stages[-1:] if brief else stages, stepwise=bool(group.get("tiered")))
         show_def = len({foe.get("def") for s in stages for foe in s["enemies"]}) > 1
         same_def.update(foe.get("def") for s in stages for foe in s["enemies"])
         rows = []

@@ -61,6 +61,7 @@ import sqlite3
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -125,7 +126,7 @@ PLAYER_INFO_URL = f"{BASE}/game/player/info"  # 明日方舟：status.lastOnline
 EF_CARD_URL = "https://zonai.skland.com/web/v1/game/endfield/card/detail"  # 终末地：base.lastLoginTime
 CHECKED_APPS = ("arknights", "endfield")
 GAP = 0.6  # 同一个 worker 两次请求之间的秒数
-WORKERS = 5  # 同时检查的账号数，与竞速榜采集相同
+WORKERS = 5  # 同时检查或签到的账号数（签到会改森空岛那边的状态，没有拿更多 worker 试过）
 RECHECK_GAP = 8  # 被拒绝的角色隔多少秒再问第二次
 NO_ROLE = "终末地绑定下没有角色（仅移除这条空记录）"
 EXPIRED = "登录已过期"  # 当场解绑的账号状态
@@ -1199,7 +1200,17 @@ SIGN_GAMES = ("arknights", "endfield")
 _signing = asyncio.Lock()  # 同一时间只有一轮签到
 
 
-async def run_daily_sign(*games: str, tell: bool = False) -> None:
+@dataclass
+class SignRound:
+    """一轮签到的结果（/全体签到 据此回一条）：各游戏的签到条目（和签到缓存里的一样），没签的账号数，出错的次数。"""
+
+    entries: dict[str, list] = field(default_factory=dict)
+    left_out: int = 0  # 等官方机器人认出的成员的账号
+    paused: int = 0  # 疑似已离开的成员的账号
+    broken: int = 0  # 一个角色或整个账号出错没签成
+
+
+async def run_daily_sign(*games: str, tell: bool = False) -> SignRound:
     """每晚签到（/全体签到 也用它）：不指定游戏时两款一轮签完。WORKERS 个账号同时签，每个账号用自己的会话，
     先方舟后终末地，第二款游戏用第一款签到时刚刷新的 token，同一个账号不会被两轮同时刷新；处理完一个账号就保存。
     等待重新绑定的、疑似已离开的成员不签。上游的钩子按一款游戏调用，那时只签那一款。
@@ -1213,11 +1224,11 @@ async def run_daily_sign(*games: str, tell: bool = False) -> None:
     """
     games = games or SIGN_GAMES
     async with _signing:  # /全体签到 赶上每晚那一轮：等它签完再签（都是“请勿重复签到”），同一个账号不会被两轮同时刷新
-        await _sign_round(games, tell)
+        return await _sign_round(games, tell)
 
 
 
-async def _sign_round(games: tuple[str, ...], tell: bool) -> None:
+async def _sign_round(games: tuple[str, ...], tell: bool) -> SignRound:
     """run_daily_sign 的正文，拿着 _signing 跑。"""
     async with get_session() as session:
         waiting = (await members_waiting(session))[0] or set()  # 查不清谁在等时照常全部签：多签几个人无害
@@ -1239,8 +1250,9 @@ async def _sign_round(games: tuple[str, ...], tell: bool) -> None:
             signed[index] = await _sign_games(todo[index], games, broken)
 
     await asyncio.gather(*(worker() for _ in range(min(WORKERS, len(todo)) or 1)))
+    report = SignRound(left_out=left_out, paused=paused, broken=broken[0])
     for game in games:
-        entries = [entry for account in signed for entry in account.get(game, [])]
+        entries = report.entries[game] = [entry for account in signed for entry in account.get(game, [])]
         sign_service.write_sign_cache(game, entries)
         last = game == games[-1]  # 出错的次数两款合计，只记在最后一行
         logger.info(f"Nightly sign-in ({game}): {len(entries)} roles done" + _sign_failures(entries) + (f", {broken[0]} ended with an error" if last and broken[0] else "") + (f"; {left_out} account(s) of members not recognised since the official bot took over left out" if left_out else "") + (f"; {paused} account(s) of members who seem to have left paused" if paused else ""))
@@ -1249,6 +1261,7 @@ async def _sign_round(games: tuple[str, ...], tell: bool) -> None:
             await _tell_own_expiry({account_id for account_id, owner_id in accounts if owner_id in own}, todo, signed, {account_id for account_id, _ in accounts})
         except Exception as e:  # 私聊不成不影响签到
             logger.warning(f"Nightly sign-in: the superuser's own expired login not told ({type(e).__name__})")
+    return report
 
 
 async def _tell_own_expiry(own: set[int], todo: list[int], signed: list[dict[str, list]], present: set[int]) -> None:

@@ -7,6 +7,7 @@ import re
 import shelve
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from time import time_ns
 from typing import Any
 
@@ -35,6 +36,7 @@ from nonebot_plugin_skland.commands.endfield.sign import ef_sign_status_handler
 from nonebot_plugin_skland.config import CACHE_DIR
 from nonebot_plugin_skland.db_handler import get_accounts, get_default_character, get_user_characters
 from nonebot_plugin_skland.matcher import skland, skland_command
+from nonebot_plugin_skland.services.sign import SignCacheFormatError, read_sign_cache
 
 from plugins.shared import private_answer
 from plugins.skland_roles import owner_id_of
@@ -507,21 +509,96 @@ sign_all_status = on_command("全体签到详情", rule=strict, permission=SUPER
 sign_status = on_command("签到详情", rule=strict, priority=5, block=True)
 
 
+CN = timezone(timedelta(hours=8))  # 北京时间
+SIGN_GAMES = {"arknights": "明日方舟", "endfield": "终末地"}
+NAMES_SHOWN = 10  # 详情里每种失败原因最多列几个角色
+REASONS_SHOWN = 5  # 每款游戏最多列几种原因，其余合成一行：森空岛出故障时几百个角色一起失败，也只是一条不长的消息
+SIGN_FAILED = re.compile(r"^接口请求失败,\s*(?:角色 \S+ (?:终末地)?签到失败[：:]\s*)?")  # 上游加在原因前面的话，带着角色 ID
+
+
+def sign_failed(entry: dict) -> bool:
+    """签到条目没签上（“请勿重复签到”是今天已经签过，算签上）。"""
+    result = entry.get("result")
+    return isinstance(result, str) and "请勿重复签到" not in result
+
+
+def _game_count(game: str, entries: list) -> str:
+    failed = sum(map(sign_failed, entries))
+    if not entries:
+        return f"{SIGN_GAMES[game]}没有要签的角色"
+    if not failed:
+        return f"{SIGN_GAMES[game]} {len(entries)} 个角色都签上了"
+    return f"{SIGN_GAMES[game]} {len(entries)} 个角色，签上 {len(entries) - failed} 个，失败 {failed} 个"
+
+
+def round_text(report, at: datetime) -> str:
+    """/全体签到 签完回的那一条：每款游戏签上、失败多少，哪些账号按规则没签。"""
+    parts = [f"全体签到完成（{at:%H:%M}）：" + "；".join(_game_count(game, report.entries.get(game, [])) for game in SIGN_GAMES) + "。"]
+    skipped = [f"等认出来的 {report.left_out} 个账号" if report.left_out else "", f"疑似已离开的 {report.paused} 个账号" if report.paused else ""]
+    if any(skipped):
+        parts.append("和".join(filter(None, skipped)) + "没签。")
+    if report.broken:
+        parts.append(f"另有 {report.broken} 处出错没签成，下一次自动签到会再签。")
+    if any(sign_failed(entry) for entries in report.entries.values() for entry in entries):
+        parts.append("要看失败的是哪几个，发 /全体签到详情。")
+    return "".join(parts)
+
+
+def _reason(result) -> str:
+    """失败原因去掉上游加的前缀（里面有角色 ID），剩下的长数字也不显示；登录过期的各种说法合成一种。"""
+    from plugins.skland_health import _says_expired  # 在本插件之后加载
+
+    said = SIGN_FAILED.sub("", " ".join(str(result).split()))
+    if _says_expired(said):
+        return "登录已过期"
+    return re.sub(r"\d{5,}", "…", said)[:40] or "没有说原因"
+
+
+def _failures(entries: list) -> list[str]:
+    """失败的角色按原因归在一起，每种原因一行，人多的在前。"""
+    by_reason: dict[str, list[str]] = {}
+    for entry in filter(sign_failed, entries):
+        by_reason.setdefault(_reason(entry["result"]), []).append(f"{entry.get('nickname', '?')}（{entry.get('server_name', '?')}）")
+    ranked = sorted(by_reason.items(), key=lambda item: -len(item[1]))
+    lines = []
+    for reason, names in ranked[:REASONS_SHOWN]:
+        more = f" 等 {len(names)} 个" if len(names) > NAMES_SHOWN else ""
+        lines.append(f"{reason}（{len(names)}）：{'、'.join(names[:NAMES_SHOWN])}{more}")
+    if rest := ranked[REASONS_SHOWN:]:
+        lines.append(f"其他 {len(rest)} 种原因（{sum(len(names) for _, names in rest)}）")
+    return lines
+
+
+def failures_text() -> str:
+    """/全体签到详情：上一轮（每晚的或 /全体签到 的）每款游戏的数目和失败的角色，一条消息。"""
+    lines = []
+    for game, name in SIGN_GAMES.items():
+        try:
+            cache = read_sign_cache(game)
+        except SignCacheFormatError:
+            lines.append(f"{name}的签到结果文件读不了，等下一轮签到")
+            continue
+        if cache is None:
+            lines.append(f"{name}还没有签到结果")
+            continue
+        lines.append(f"{_game_count(game, cache['data'])}（{cache['timestamp']}）")
+        lines += _failures(cache["data"])
+    return "\n".join(lines)
+
+
 @sign_all.handle()
-async def _(bot: OneBotV11Bot, user_session: UserSession, session: async_scoped_session) -> None:
+async def _() -> None:
     """两个游戏一轮签完，就是每晚签到那一套（plugins/skland_health：几个账号并行、每个账号先方舟后终末地、
-    签完一个保存一个、等重新绑定和疑似已离开的成员不签），签完回复两份签到结果。"""
+    签完一个保存一个、等重新绑定和疑似已离开的成员不签），签完只回一条：每个角色的结果在 /全体签到详情。"""
     from plugins import skland_health  # 在本插件之后加载
 
-    await skland_health.run_daily_sign()
-    await arksign_status_handler(user_session, session, bot, True, is_superuser=True)
-    await ef_sign_status_handler(user_session, session, bot, True, is_superuser=True)
+    report = await skland_health.run_daily_sign()
+    await sign_all.finish(round_text(report, datetime.now(CN)))
 
 
 @sign_all_status.handle()
-async def _(bot: OneBotV11Bot, user_session: UserSession, session: async_scoped_session) -> None:
-    await arksign_status_handler(user_session, session, bot, True, is_superuser=True)
-    await ef_sign_status_handler(user_session, session, bot, True, is_superuser=True)
+async def _() -> None:
+    await sign_all_status.finish(failures_text())
 
 
 @sign_status.handle()

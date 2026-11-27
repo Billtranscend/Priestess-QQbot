@@ -76,6 +76,10 @@ CN = stages.CN
 DIFFICULTY_WORDS = {
     "普通": "普通", "简单": "普通", "困难": "困难", "残酷": "残酷", "增辉": "残酷",
     "苦难": "苦难", "镀层": "苦难", "高难": "苦难",
+    # 分级的丰碑：Ⅷ、VIII、8级 都是第八级（只写数字时 /敌人 关卡名 8 也认）
+    **{tier: tier for tier in wiki_data.TIERS},
+    **dict(zip(("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"), wiki_data.TIERS)),
+    **{f"{n}级": tier for n, tier in enumerate(wiki_data.TIERS, 1)},
 }
 STAGE_NUMBER = re.compile(r"^第?(\d{1,2})关?$")  # "2" / "第2关"：按序号指定影拓丰碑中的一关
 ROTATION_WORDS = ("战争回响", "回响", "本周", "本期")
@@ -212,12 +216,12 @@ def _resolve(endgame: dict, query: str) -> tuple[str, object] | None:
     return None
 
 
-def _words(arg: Message) -> tuple[str, str | None, int | None]:
-    """从指令参数中取出（名字，难度，关卡序号）。"""
+def _words(arg: Message) -> tuple[str, str | None, list[tuple[int, bool]]]:
+    """从指令参数中取出（名字，难度，序号）。序号按出现顺序，各带上是不是只写了数字（"2"，不是 "第2关"）。"""
     words = arg.extract_plain_text().split()
     difficulty = next((DIFFICULTY_WORDS[w] for w in words if w in DIFFICULTY_WORDS), None)
-    number = next((int(m.group(1)) for w in words if (m := STAGE_NUMBER.match(w))), None)
-    return "".join(w for w in words if w not in DIFFICULTY_WORDS and not STAGE_NUMBER.match(w)), difficulty, number
+    numbers = [(int(m.group(1)), w.isdigit()) for w in words if (m := STAGE_NUMBER.match(w))]
+    return "".join(w for w in words if w not in DIFFICULTY_WORDS and not STAGE_NUMBER.match(w)), difficulty, numbers
 
 
 def _numbered(series: dict) -> str:
@@ -231,7 +235,8 @@ async def _foe_icons(groups: list[dict]) -> dict[str, str]:
 
 
 def _cover_jobs(series: list[dict], groups: list[dict]) -> list[tuple[str, str, int]]:
-    return [stages.poster(s) for s in series] + [stages.stage_cover(g, wiki_data.stage_cover_url(g)) for g in groups]
+    stand_ins = [g for s in series for g in stages.stand_ins(s)]  # 没有丰碑封面时总览要用的关卡封面
+    return [stages.poster(s) for s in series] + [stages.stage_cover(g, wiki_data.stage_cover_url(g)) for g in [*groups, *stand_ins]]
 
 
 async def _rich_css() -> None:
@@ -359,7 +364,10 @@ def _monument_text(endgame: dict) -> str:
     lines += [f"【{series['name']}】{_numbered(series)}" for series in endgame.get("monument", [])]
     if endgame.get("monument"):
         first = endgame["monument"][0]
-        lines.append(f"\n机制和敌人属性发 /敌人 关卡名，例如 /敌人 {first['groups'][0]['name']} 苦难\n整个丰碑发 /敌人 {first['name']}")
+        group = first["groups"][0]
+        example = f"{first['name']} 1 {len(group['stages'])}级" if group.get("tiered") else f"{group['name']} {_top_difficulty(group)}"
+        how = "丰碑名 序号 级数" if group.get("tiered") else "关卡名"
+        lines.append(f"\n机制和敌人属性发 /敌人 {how}，例如 /敌人 {example}\n整个丰碑发 /敌人 {first['name']}")
     return "\n".join(lines)
 
 
@@ -394,13 +402,16 @@ async def _(arg: Message = CommandArg()) -> None:
         return stages.series_html(ef_theme, series, art, icons, time.time(), _version(), marked)
 
     await _send_page(monument_list, page, f"影拓丰碑【{series['name']}】（按游戏内顺序）：{_numbered(series)}")
-    # 无文字兜底：图的页脚已写明 /丰碑竞速 丰碑名 和 /敌人 丰碑名
-    await send_buttons(f"**{series['name']}**", [[("本群竞速榜", f"/丰碑竞速 {series['name']}"), ("机制和敌人", f"/敌人 {series['name']}")]])
+    rows = [[("本群竞速榜", f"/丰碑竞速 {series['name']}"), ("机制和敌人", f"/敌人 {series['name']}")]]
+    if stages.tiered(series):  # 每关有八级，各给一个按钮直接看它的机制和敌人
+        rows += rows_of([(g["name"], f"/敌人 {series['name']} {g['no']}") for g in series["groups"]])  # 关卡名可能也是领袖敌人的名字
+    # 无文字兜底：图的页脚已写明 /丰碑竞速 丰碑名 和 /敌人 丰碑名（或关卡名）
+    await send_buttons(f"**{series['name']}**", rows)
 
 
 @enemy.handle()
 async def _(arg: Message = CommandArg(), command: tuple[str, ...] = Command()) -> None:
-    query, difficulty, number = _words(arg)
+    query, difficulty, numbers = _words(arg)
     endgame = _endgame()
     monument = endgame.get("monument", [])
     query = query or {"回响敌人": "战争回响", "丰碑敌人": "影拓丰碑"}.get(command[0], "")
@@ -419,7 +430,7 @@ async def _(arg: Message = CommandArg(), command: tuple[str, ...] = Command()) -
 
         await _send_page(enemy, build_leader, "敌人资料图生成失败，请稍后再试")
         return
-    series = None
+    series, rest = None, numbers  # rest：选完关卡后剩下的序号，分级的关卡用来选级别
     if query in ROTATION_WORDS:
         current = _rotation(endgame)
         if not current:
@@ -442,12 +453,15 @@ async def _(arg: Message = CommandArg(), command: tuple[str, ...] = Command()) -
             groups = [found[1]]
             title, scope = f"机制与敌人 · <em>{escape(found[1]['name'])}</em>", found[1].get("series") or "战争回响"
     if series is not None:
+        number = numbers[0][0] if numbers else None
         if number and 1 <= number <= len(series["groups"]):
-            groups = [series["groups"][number - 1]]
+            groups, rest = [series["groups"][number - 1]], numbers[1:]
             title, scope = f"机制与敌人 · <em>{escape(groups[0]['name'])}</em>", series["name"]
         else:
-            groups = series["groups"]
+            groups, rest = series["groups"], []
             title, scope = f"机制与敌人 · <em>{escape(series['name'])}</em>", f"影拓丰碑 · 共 {len(groups)} 关"
+    if len(groups) == 1 and groups[0].get("tiered") and not difficulty and rest and rest[0][1] and 1 <= rest[0][0] <= len(groups[0]["stages"]):
+        difficulty = groups[0]["stages"][rest[0][0] - 1]["difficulty"]  # 分级的关卡：后面的数字是第几级
     if difficulty and not any(s["difficulty"] == difficulty for g in groups for s in g["stages"]):
         difficulty = None
     chips = f"<span>{escape(scope)}</span><span>{escape(difficulty) if difficulty else '全部难度'}</span>"
@@ -546,7 +560,15 @@ def _fmt_time(seconds: int) -> str:
 
 
 def _top_difficulty(group: dict) -> str:
+    if group.get("tiered"):
+        return group["stages"][-1]["difficulty"]
     return "残酷" if group["mode"] == "战争回响" else "苦难"
+
+
+def _monument_tops(endgame: dict) -> str:
+    """丰碑榜和出场率统计用的难度：苦难，有分级的丰碑时再加上它的最高级（苦难 / Ⅷ）。"""
+    tops = list(dict.fromkeys(_top_difficulty(g) for s in endgame.get("monument", []) for g in s["groups"])) or ["苦难"]
+    return " / ".join(sorted(tops, key=lambda top: top != "苦难"))  # 苦难在前，其余按丰碑的顺序
 
 
 async def _icon(char_id: str) -> str:
@@ -622,7 +644,8 @@ async def _speed_card(data, pool, names, group, difficulty, requester, limit) ->
     number = f"第{group['no']}关 · " if group.get("no") else ""
     header = f'<h3>{number}{escape(group["name"])} · {difficulty}<small class="cjk">{len(ranking)} 人有用时记录</small></h3>'
     if not ranking:
-        return f'<div class="ef-sec">{header}<div class="ef-empty">本群还没有这关{difficulty}的用时记录</div></div>'
+        level = f" {difficulty} 难度" if difficulty in set(wiki_data.TIERS) else difficulty
+        return f'<div class="ef-sec">{header}<div class="ef-empty">本群还没有这关{level}的用时记录</div></div>'
     shown = ranking[:limit]
     me = next((i for i, (qq, _) in enumerate(ranking, 1) if qq == requester), None)
     if me and me > limit:
@@ -644,7 +667,7 @@ SPEED_MENU = (
     "\n① 回响竞速（战争回响 · 残酷）\n"
     "　/回响竞速 → 本周全部关卡\n"
     "　/回响竞速 关卡名 → 单关完整榜\n"
-    "\n② 丰碑竞速（影拓丰碑 · 苦难）\n"
+    "\n② 丰碑竞速（影拓丰碑 · 苦难，分级的丰碑为最高一级）\n"
     "　/丰碑竞速 → 选择要查的丰碑\n"
     "\n关卡名记不清？本周关卡发 /战争回响，丰碑关卡发 /影拓丰碑"
 )
@@ -795,12 +818,12 @@ STATS_FOOT = (
 def _usage_scope(endgame: dict, query: str) -> tuple[set[str], str] | None:
     """出场率一栏统计哪些通关：（关卡键，标签）；查询词什么都没对上时为 None。"""
     if not query:
-        return {f"{g['name']}|{_top_difficulty(g)}" for g in _stage_groups(endgame)}, "全部关卡（战争回响残酷、影拓丰碑苦难）"
+        return {f"{g['name']}|{_top_difficulty(g)}" for g in _stage_groups(endgame)}, f"全部关卡（战争回响残酷、影拓丰碑{_monument_tops(endgame)}）"
     if query in ("战争回响", "本周"):
         current = _current_week(endgame)
         return ({f"{endgame['tower'][g]['name']}|残酷" for g in current[1]["groups"] if g in endgame["tower"]} if current else set()), "本周战争回响（残酷）"
     if query == "影拓丰碑":
-        return {f"{g['name']}|苦难" for s in endgame.get("monument", []) for g in s["groups"]}, "影拓丰碑（苦难）"
+        return {f"{g['name']}|{_top_difficulty(g)}" for s in endgame.get("monument", []) for g in s["groups"]}, f"影拓丰碑（{_monument_tops(endgame)}）"
     found = _resolve(endgame, query)
     if not found or found[0] != "group":
         return None

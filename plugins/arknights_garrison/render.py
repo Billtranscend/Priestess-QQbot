@@ -48,27 +48,19 @@ img { display: block; object-fit: contain; }
 .tiles i { font-style: normal; font-size: 13px; color: var(--ak-faint); }
 .tiles .bar { height: 4px; margin-top: 6px; background: var(--ak-line); } .tiles .bar u { display: block; height: 4px; background: var(--ak-blue); }
 
-.pair { display: grid; grid-template-columns: 400px 1fr; gap: 16px; }
-.band { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--ak-line); }
-.band:first-child { border-top: 0; }
-.band .ic { width: 56px; height: 56px; flex: none; background: #111; border: 1px solid var(--ak-line-2); }
-.band .ic img, .band .ic .ph { width: 54px; height: 54px; }
-.band .nm { font-size: 20px; font-weight: 900; color: #fff; }
-.band .nm .ak-tag { margin-left: 6px; vertical-align: 3px; }
-.band .meta { margin-top: 2px; font-size: 14px; color: var(--ak-sub); }
-.band .meta b { font-family: var(--ak-num); font-size: 20px; color: #fff; margin-right: 2px; }
-.band .rate { margin-left: auto; text-align: right; width: 100px; }
-.band .rate b { font-family: var(--ak-num); font-size: 26px; color: var(--ak-blue); }
-.band .rate small { display: block; font-size: 12px; color: var(--ak-faint); }
-.bonds { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; padding: 14px 16px 16px; }
-.bond { background: var(--ak-panel-2); border: 1px solid var(--ak-line); padding: 10px 6px 9px; text-align: center; }
-.bond .ic { width: 58px; height: 58px; margin: 0 auto; border-radius: 50%%; background: radial-gradient(#1d3b33, #101012 70%%); border: 1px solid #2f6b5c; }
-.bond .ic img, .bond .ic .ph { width: 56px; height: 56px; border-radius: 50%%; }
-.bond .nm { margin-top: 6px; font-size: 17px; font-weight: 900; color: #fff; }
-.bond .ct { margin-top: 2px; font-size: 13px; color: var(--ak-sub); }
-.bond .ct b { font-family: var(--ak-num); font-size: 19px; color: #fff; margin-right: 1px; }
-.bond .best { margin-top: 3px; font-size: 12px; color: var(--ak-faint); }
-.bond .best b { font-family: var(--ak-num); font-size: 15px; color: var(--ak-yellow); }
+.picks { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; padding: 14px 16px 16px; }
+.pick { background: var(--ak-panel-2); border: 1px solid var(--ak-line); padding: 10px 6px 9px; text-align: center; }
+.pick .ic { width: 60px; height: 60px; margin: 0 auto; background: #111; border: 1px solid var(--ak-line-2); }
+.pick .ic img, .pick .ic .ph { width: 58px; height: 58px; }
+.pick.bond .ic { border-radius: 50%%; background: radial-gradient(#1d3b33, #101012 70%%); border-color: #2f6b5c; }
+.pick.bond .ic img, .pick.bond .ic .ph { border-radius: 50%%; }
+.pick .nm { margin-top: 6px; font-size: 17px; font-weight: 900; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pick .tag { height: 20px; margin-top: 3px; }
+.pick .ct { margin-top: 2px; font-size: 13px; color: var(--ak-sub); }
+.pick .ct b { font-family: var(--ak-num); font-size: 19px; color: #fff; margin-right: 1px; }
+.pick .best { margin-top: 3px; font-size: 12px; color: var(--ak-faint); }
+.pick .best b { font-family: var(--ak-num); font-size: 15px; color: var(--ak-yellow); }
+.pick .best b.rate { color: var(--ak-blue); }
 
 .titles { display: grid; grid-template-columns: 340px 1fr; gap: 10px; padding: 12px 16px 16px; }
 .radar svg { display: block; }
@@ -173,7 +165,7 @@ def _tiles(view) -> str:
     tiles = [
         ("总场次", f"{total}", " · ".join(f"{m.label} {m.total}" for m in view.modes) or "暂无"),
         ("完成率", f"{round(100 * wins / total) if total else 0}<span>%</span>", f"完成 {wins} 局"),
-        ("Boss 击杀", f"{escape(boss.value) if boss else 0}" + (f"<em>隐秘 {escape(boss.secondary_value)}</em>" if boss and boss.secondary_value else ""), "击败的 Boss 数"),
+        ("Boss 击杀", f"{escape(boss.value) if boss else 0}" + (f"<em>隐秘 {escape(boss.secondary_value)}</em>" if boss and boss.secondary_value else ""), escape(boss.detail) if boss and boss.detail else "击败的 Boss 数"),
         ("游戏时长", escape(metric["游戏时长"].value) if "游戏时长" in metric else "-", escape(metric["游戏时长"].detail) if "游戏时长" in metric else ""),
     ]
     for label in ("独立", "联合"):
@@ -189,23 +181,29 @@ def _tiles(view) -> str:
     return f'<div class="tiles">{"".join(out)}</div>'
 
 
+def _badge(text: str) -> str:
+    return f'<span class="ak-tag b">{escape(text)}</span>' if text else ""
+
+
 def _preferences(view) -> str:
+    """常用策略、常用盟约各一行，每行前 5 个（顺序由 season.py 排好：场数多的在前，场数相同时完成率高的在前）。"""
     bands = "".join(
-        f'<div class="band"><div class="ic">{_img(s.icon_url)}</div><div><div class="nm">{escape(s.name)}'
-        + (f'<span class="ak-tag b">{escape(s.badge)}</span>' if s.badge else "")
-        + f'</div><div class="meta"><b>{s.recent_count}</b>场 · 完成 {s.recent_wins}</div></div>'
-        f'<div class="rate"><b>{_percent(s.win_percent)}%</b><small>完成率</small></div></div>'
-        for s in view.strategies[:3]
+        f'<div class="pick"><div class="ic">{_img(s.icon_url)}</div><div class="nm">{escape(s.name)}</div>'
+        f'<div class="tag">{_badge(s.badge)}</div>'
+        f'<div class="ct"><b>{s.count if s.count is not None else s.recent_count}</b>场</div>'
+        f'<div class="best">完成率 <b class="rate">{_percent(s.win_percent)}%</b></div></div>'
+        for s in view.strategies[:5]
     ) or '<div class="ak-empty">暂无常用策略</div>'
     shown = [b for b in view.bonds if b.max_layer] or view.bonds  # 从没叠过层的（如「绝技」）不列
     bonds = "".join(
-        f'<div class="bond"><div class="ic">{_img(b.icon_url)}</div><div class="nm">{escape(b.name)}</div>'
+        f'<div class="pick bond"><div class="ic">{_img(b.icon_url)}</div><div class="nm">{escape(b.name)}</div>'
         f'<div class="ct"><b>{b.recent_count}</b>场</div><div class="best">最高 <b>{b.max_layer or 0}</b> 层</div></div>'
         for b in shown[:5]
     ) or '<div class="ak-empty">暂无常用盟约</div>'
+    scope = f'<small class="cjk">{escape(view.recent_scope)}</small>'
     return (
-        f'<div class="pair"><div class="ak-sec"><h3>常用策略<small class="cjk">{escape(view.recent_scope)}</small></h3>{bands}</div>'
-        f'<div class="ak-sec"><h3>常用盟约<small>Covenant</small></h3><div class="bonds">{bonds}</div></div></div>'
+        f'<div class="ak-sec"><h3>常用策略{scope}</h3><div class="picks">{bands}</div></div>'
+        f'<div class="ak-sec"><h3>常用盟约{scope}</h3><div class="picks">{bonds}</div></div>'
     )
 
 
