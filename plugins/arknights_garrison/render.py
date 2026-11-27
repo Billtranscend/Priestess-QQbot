@@ -300,7 +300,7 @@ def _page(body: str, now: float | None) -> str:
     now = now or time.time()
     return (
         f'<!doctype html><html><head><meta charset="utf-8"><style>{ark_theme.css()}{CSS}</style></head><body class="ak">{body}'
-        + ark_theme.foot(f'数据来源 森空岛 · 官方数据每天 10:00 刷新<br>生成时间 {time.strftime("%Y-%m-%d %H:%M", time.localtime(now))}')
+        + ark_theme.foot(f'数据来源 森空岛 · 奖杯和场次算到最新一局，其余官方数据每天 10:00 刷新<br>生成时间 {time.strftime("%Y-%m-%d %H:%M", time.localtime(now))}')
         + "</body></html>"
     )
 

@@ -5,7 +5,7 @@
 图由本插件按 /mrfz开盒 的明日方舟风格绘制，每个图标都写上名字和数字（render.py）。
 资源表约 500 KB，在内存里缓存一天，战绩每次查询时现取。森空岛只给最近 100 局：每次读到的对局摘要存进 HISTORY
 （season.py，一个 SQLite 库，长期保存），常用策略、常用盟约、Boss 击杀和游戏时长按本赛季记录到的对局算；每天统计卫戍榜后
-删掉不再绑定的角色的记录。
+删掉不再绑定的角色的记录。官方的奖杯和场次只算到当天 0 点，之后结束的对局由 live.py 补上，/卫 和卫戍榜都是最新的。
 
 /卫 的选项用中文：全部（全部记录）、收藏（收藏的对局）、详情 [第几局]（不带数字时列出各局供点选）。
 查自己时下面跟着这些选项的按钮。
@@ -77,6 +77,7 @@ from plugins.shared import write_json
 from plugins.skland_roles import member_numbers
 
 from . import render
+from .live import catch_up
 from .season import History, season_view
 from .stats import Standing, ranked, standing
 
@@ -236,7 +237,7 @@ async def view_of(user: SkUser, character: Character, **choice) -> GarrisonView:
         data, res, uid=str(character.uid), server_name=character.server_name, channel_master_id=character.channel_master_id,
         activity_id=activity, **choice,
     )
-    return season_view(view, records, data.career, res, activity)
+    return catch_up(season_view(view, records, data.career, res, activity), data.history.records, data.career, activity, time.time())
 
 
 def parse_choice(text: str) -> dict | str | None:
